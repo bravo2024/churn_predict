@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local tooling / session state (not part of the project)
+.codegraph/
+.omo/
+
+# Large files hosted on Hugging Face (vivekkopthsd/churn-predict-data)
+# and fetched at runtime by build_dataset.py / dashboard.py
+data/raw/ordered_open_ecommerce.parquet
+models/artifacts.pkl
+
+# OS junk
+.DS_Store
+Thumbs.db
