@@ -1,4 +1,4 @@
-# churn_predict
+# Customer Churn Prediction and Retention-Budget Optimization
 
 Customer churn prediction and retention-budget optimization on real e-commerce data. The
 project predicts which customers lapse within a 90-day window, explains the drivers of
