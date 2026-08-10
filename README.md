@@ -140,7 +140,7 @@ python train_models.py       # models and artifacts for the dashboard
 streamlit run dashboard.py   # interactive dashboard (scope-selectable)
 ```
 
-All random seeds are 42. Environment: Python 3.11, pandas 2.2, scikit-learn 1.5,
+All random seeds are 42. Environment: Python 3.11, pandas 2.2, scikit-learn 1.9,
 xgboost 3.2, scikit-survival 0.28, shap 0.51, streamlit 1.53.
 
 ## Repository structure
