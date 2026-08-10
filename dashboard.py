@@ -35,6 +35,10 @@ from sklearn.cluster import KMeans
 from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy import stats
 
+import os as _os
+ON_CLOUD = (_os.environ.get("STREAMLIT_SERVER_HEADLESS") == "true"
+            or "streamlit.app" in _os.environ.get("HOSTNAME", ""))
+
 import train_models as tm
 
 warnings.filterwarnings("ignore")
@@ -233,6 +237,7 @@ def per_model_importance():
     return out
 
 
+@st.cache_data(show_spinner="Solving MILP...")
 def solve_milp_live(ts, B, offers=(5, 10, 15, 20, 25), base=0.04, slope=0.018, cap=0.60):
     """Exact 0/1-knapsack allocation for the current scoring mode (survival or binary)."""
     def r(d):
@@ -249,7 +254,7 @@ def solve_milp_live(ts, B, offers=(5, 10, 15, 20, 25), base=0.04, slope=0.018, c
         A_one[i, i * len(offers):(i + 1) * len(offers)] = 1.0
     res = milp(c=-DV.ravel(), integrality=np.ones(n * len(offers)), bounds=Bounds(0, 1),
                constraints=[LinearConstraint(A_bud, ub=B), LinearConstraint(A_one, ub=1.0)],
-               options={"time_limit": 90})
+               options={"time_limit": 15})
     x = np.round(res.x).astype(int).reshape(n, len(offers))
     al = ts[["Customer_ID", "Churn_Prob", "CLV_3Yr"]].copy()
     al["Offer_USD"] = (x * np.array(offers)).sum(axis=1)
@@ -841,16 +846,20 @@ with T[IDX["7 · Optimizer (MILP)"]]:
         m = OFFER["milp_by_budget"][int(B)]
 
     # greedy + naive for the selected mode (fast, live)
-    rows = []
-    for _, r in ts_off.iterrows():
-        pi, clv, urg = r["Churn_Prob"], r["CLV_3Yr"], r["urgency"]
-        best_d, br = 0, 0.0
-        for d in (5, 10, 15, 20, 25):
-            incr = pi * clv * urg * (response(d) - response(0))
-            if incr / d > br and incr > 0:
-                best_d, br = d, incr / d
-        rows.append((best_d, pi * clv * urg * (response(best_d) - response(0)) if best_d else 0.0))
-    gdf = pd.DataFrame(rows, columns=["Offer_USD", "Incr_Retained_Rev"])
+    _p = ts_off["Churn_Prob"].to_numpy()
+    _V = ts_off["CLV_3Yr"].to_numpy()
+    _U = ts_off["urgency"].to_numpy()
+    _d = np.array([5, 10, 15, 20, 25], dtype=float)
+    _resp = np.clip(0.04 + 0.018 * _d, 0.0, 0.60) - 0.04
+    _incr = (_p * _V * _U)[:, None] * _resp[None, :]
+    _ratio = _incr / _d[None, :]
+    _mask_any = _incr > 0
+    _ratio = np.where(_mask_any, _ratio, 0.0)
+    _best_k = _ratio.argmax(axis=1)
+    _row_idx = np.arange(len(_p))
+    _best_offer = np.where(_ratio[_row_idx, _best_k] > 0, _d[_best_k], 0.0)
+    _best_incr = np.where(_ratio[_row_idx, _best_k] > 0, _incr[_row_idx, _best_k], 0.0)
+    gdf = pd.DataFrame({"Offer_USD": _best_offer, "Incr_Retained_Rev": _best_incr})
     gdf = gdf[gdf.Offer_USD > 0].sort_values("Incr_Retained_Rev", ascending=False)
     gc = gdf.Offer_USD.cumsum().values
     gr = gdf.Incr_Retained_Rev.cumsum().values
