@@ -195,7 +195,52 @@ default has moved to 3.12/3.13/3.14. Consequences:
 
 ---
 
-## Plan
+## Status: implemented and verified (commit `6ce00f0`, pushed to `main`)
+
+| Change | Where | Verified |
+|---|---|---|
+| `repo_type="dataset"` in `hf_hub_download`, failure surfaced as a warning | `dashboard.py` `hf_download()` | dataset URL 200 / model URL 401 reproduced |
+| Load order slim file → full file → HF, **never trains** | `dashboard.py` `load_artifacts()` | error path stops with a message instead of retraining |
+| `models/artifacts_slim.pkl` committed, 9,753,164 bytes, sha256 `7f3f6b76…` | repo | 12/12 dashboard keys, 5/5 survival keys, 20 budgets |
+| Sparse `A_one` via `kron(speye, …)` | `solve_milp_live()` | 0.192 MB, 4.8 s, optimum identical |
+| Survival weighting solved on request (`st.session_state["milp_surv"]`) | tab 7 | click → $87,088 / 8.7x / 400 customers, no exception |
+| No `import train_models`; `FEATURES` inlined | top of `dashboard.py` | xgboost/sksurv off the boot path |
+| `slim_artifacts()` + dual output | `train_models.py` | writes 246.6 MB and 9.8 MB |
+
+Kernel `vivekkopthsd/churn-predict-slim-artifacts` (version 3) built the artifact on Kaggle from
+the canonical 246.6 MB artifact mounted as the private dataset
+`vivekkopthsd/churn-predict-full-artifact`, with hard assertions:
+
+```
+source artifact: 246.6 MB          pickled with scikit-learn 1.9.1
+slim artifact: 9.8 MB (4.0%)       sha256 7f3f6b767fea51c8326e6f8f715176f3e82b6637cb1ac1a7bc054db38c0e258e
+all 12 dashboard keys present      survival keys: cindex_cox, cindex_rsf, corr_s90_binary, horizons, probs
+precomputed @ $10,000: rev=$159,027 roas=15.90x customers=400
+MILP optimal=True retained=$159,027 roas=15.90x customers=400 matrix=0.192 MB
+```
+
+`streamlit.testing.AppTest` on the patched app: **no exception, 9 tabs, 23 charts, 299 MB RSS**
+(was 541 MB), peak **699 MB** (was 942 MB), survival checkbox `False` on first paint.
+
+### One deliberate display change
+
+The legacy first paint solved with survival weights on and showed **$87,088 / 8.7x**, while the
+page caption, README and CV all state **$159,027 / 15.9x**. Defaulting to the binary
+precomputed optimum makes the cards agree with the documented figures; the survival-weighted
+result is one click away and is byte-identical to what the old default produced ($87,088 / 8.7x
+/ 400 customers at $10,000).
+
+### Remaining, user-side
+
+1. In the Cloud app: **Reboot app** (the push alone may not cycle the container).
+2. Set **Python 3.11** in app settings if it is not already (delete + redeploy; `.python-version`
+   is ignored).
+3. The Hugging Face copy is **stale** (sklearn 1.9.0, optimum $220,409 / 22.0x). It is only a
+   fallback now, but refresh `models/artifacts.pkl` there so it cannot mislead later.
+
+---
+
+## Plan (original, for reference)
 
 ### Phase 0 — the two changes that actually fix it (~1 h)
 
