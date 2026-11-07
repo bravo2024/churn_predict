@@ -1,11 +1,12 @@
 """
-Customer Retention Analytics - Business Analytics Dashboard.
+Customer Retention Analytics - business analytics dashboard.
 
-Tabs follow the analysis notebook step by step. A scope selector in the sidebar
-chooses which modules appear - Churn, Churn + Survival, or Churn + Optimization +
-Survival. Core logic (temporal validation, models, MILP, survival) is unchanged from
-the validated pipeline. Text is brief, third person, passive voice, no colons or
-semicolons, white background with black text.
+Nine tabs follow the analysis notebook; a sidebar scope selector chooses which
+modules appear (churn, churn plus survival, churn plus optimization plus survival).
+
+Every figure attached to a pre-trained model is read from models/artifacts_slim.pkl,
+so the dashboard cannot disagree with train_models.py. Figures that depend on a
+control are computed from that control at render time rather than quoted in prose.
 
 Run:  streamlit run dashboard.py
 """
@@ -36,11 +37,8 @@ from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy import stats
 from scipy.sparse import csr_matrix, eye as speye, kron
 
-import os as _os
-ON_CLOUD = (_os.environ.get("STREAMLIT_SERVER_HEADLESS") == "true"
-            or "streamlit.app" in _os.environ.get("HOSTNAME", ""))
-
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 RANDOM_STATE = 42
 BASE = os.path.dirname(os.path.abspath(__file__))
 ARTIFACTS = os.path.join(BASE, "models", "artifacts.pkl")
@@ -54,8 +52,17 @@ FEATURES = ["orders_12m", "spend_12m", "aov_12m", "aov_recent", "aov_prior", "ao
             "entertainment_share", "gaming_share", "media_share", "gift_card_share", "ott_flag",
             "Age", "Annual_Income_USD", "Household_Size", "Hispanic", "Reported_Usage_Freq",
             "Gender", "Education_Level", "Race_Group", "Region"]
+# Offer menu and the documented response assumption. Defined once and used by the MILP,
+# the greedy benchmark and the mathematics panel, so the three cannot drift apart.
+OFFERS = (5, 10, 15, 20, 25)
+RESPONSE = {"base": 0.04, "slope": 0.018, "cap": 0.60}
 # Artifacts are too large for GitHub (197 MB) and are hosted on Hugging Face.
 HF_DATA_REPO = "vivekkopthsd/churn-predict-data"
+
+
+def response(d):
+    """Probability an offer of `d` dollars retains a customer who would otherwise churn."""
+    return float(np.clip(RESPONSE["base"] + RESPONSE["slope"] * d, 0.0, RESPONSE["cap"]))
 
 
 def hf_download(filename):
@@ -93,11 +100,11 @@ h1,h2,h3{{color:#000;}}
  padding:8px 14px;margin:8px 0;font-size:.95rem;color:#111;}}
 div[data-testid="stTabs"] button[data-baseweb="tab"]{{font-size:.82rem;padding:6px 12px;}}
 div[data-testid="stTabs"] [data-baseweb="tab-list"]{{gap:4px;}}
-.amz-card{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;margin:8px 0;
- box-shadow:0 1px 2px rgba(0,0,0,.05);}}
-.amz-card-title{{font-size:.95rem;font-weight:700;color:#0f1111;margin-bottom:4px;}}
-.amz-card-text{{font-size:.86rem;color:#111;line-height:1.4;}}
-.amz-footer{{font-size:.72rem;color:#767676;margin-top:12px;padding-top:8px;border-top:1px solid #e7e7e7;}}
+.panel{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;margin:8px 0;
+ box-shadow:0 1px 2px rgba(15,23,42,.05);border-left:3px solid {BLUE};}}
+.panel-title{{font-size:.9rem;font-weight:700;color:{NAVY};letter-spacing:.02em;margin-bottom:4px;}}
+.panel-text{{font-size:.88rem;color:#111;line-height:1.45;}}
+.panel-foot{{font-size:.74rem;color:{GRAY};margin-top:12px;padding-top:8px;border-top:1px solid #e2e8f0;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -118,6 +125,13 @@ def metric_card(col, value, label, sub=None, sub_color=GREEN):
 
 def interp(text):
     st.markdown(f'<div class="interpret">{text}</div>', unsafe_allow_html=True)
+
+
+def panel(title, text, sub=None, where=st):
+    """One bordered panel, used for the sidebar key result and the recommendations."""
+    sub_html = f'<div class="panel-foot">{sub}</div>' if sub else ""
+    where.markdown(f'<div class="panel"><div class="panel-title">{title}</div>'
+                   f'<div class="panel-text">{text}</div>{sub_html}</div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- core logic (preserved)
@@ -206,31 +220,39 @@ def train_churn(algo, window, max_depth, n_estimators, lr, C):
         "Recall": round(float(recall_score(y_te, p)), 4),
         "F1": round(float(f1_score(y_te, p)), 4),
     }
-    names = FEATURES if algo == "Logistic Regression" else None
     imp = None
-    if hasattr(m, "feature_importances_"):
+    names = None
+    if hasattr(m, "feature_importances_") or algo == "Logistic Regression":
         num = [f for f in FEATURES if tr[f].dtype.kind in "iuf"]
         cat = [f for f in FEATURES if tr[f].dtype.kind == "O"]
         names = num + list(pre.named_transformers_["cat"].named_steps["encoder"].get_feature_names_out(cat))
-        imp = pd.Series(m.feature_importances_, index=names).sort_values(ascending=False).head(12)
-    elif algo == "Logistic Regression":
-        num = [f for f in FEATURES if tr[f].dtype.kind in "iuf"]
-        cat = [f for f in FEATURES if tr[f].dtype.kind == "O"]
-        names = num + list(pre.named_transformers_["cat"].named_steps["encoder"].get_feature_names_out(cat))
-        imp = pd.Series(np.abs(m.coef_[0]), index=names).sort_values(ascending=False).head(12)
+        weights = (np.abs(m.coef_[0]) if algo == "Logistic Regression"
+                   else m.feature_importances_)
+        imp = pd.Series(weights, index=names).sort_values(ascending=False).head(12)
     return {"metrics": metrics, "imp": imp, "train_s": train_s, "prob": prob, "y_te": y_te,
             "base_rate": float(y_te.mean()), "conf": confusion_matrix(y_te, p), "algo": algo,
             "model": m, "names": names}
 
 
 @st.cache_data(show_spinner=False)
-def voting_test_confusion():
+def voting_test_eval():
+    """Test-period behaviour of the voting ensemble, the model the artifact scores offers with.
+
+    Returned together so the count on the card and the confusion matrix beneath it are the
+    same model at the same 0.5 cutoff. The artifact's churn_summary reports the XGBoost
+    count, which is a different number (367 against 323) and used to sit next to a Voting
+    matrix with no label saying so.
+    """
     tr, te = load_snapshots()
     Xp_tr, pre = make_pre(tr)
     Xp_te = pre.transform(te[FEATURES])
     y = te["label_churn"].values
-    p = A["fitted_models"]["Voting (Ch7)"].predict(Xp_te)
-    return confusion_matrix(y, p)
+    pred = A["fitted_models"]["Voting (Ch7)"].predict(Xp_te)
+    tn, fp, fn, tp = confusion_matrix(y, pred).ravel()
+    return {"conf": confusion_matrix(y, pred), "predicted_churned": int(pred.sum()),
+            "customers": int(len(y)), "churners": int(y.sum()),
+            "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+            "recall": float(tp / (tp + fn)) if tp + fn else 0.0}
 
 
 @st.cache_data(show_spinner=False)
@@ -264,15 +286,15 @@ def per_model_importance():
 
 
 @st.cache_data(show_spinner="Solving MILP...")
-def solve_milp_live(ts, B, offers=(5, 10, 15, 20, 25), base=0.04, slope=0.018, cap=0.60):
+def solve_milp_live(ts, B):
     """Exact 0/1-knapsack allocation for the current scoring mode (survival or binary)."""
-    def r(d):
-        return float(np.clip(base + slope * d, 0.0, cap))
-    r0 = r(0)
+    offers = OFFERS
+    r0 = response(0)
     p = ts["Churn_Prob"].values
     V = ts["CLV_3Yr"].values
     U = ts["urgency"].values
-    DV = np.array([[pi * Vi * U[i] * (r(d) - r0) for d in offers] for i, (pi, Vi) in enumerate(zip(p, V))])
+    DV = np.array([[pi * Vi * U[i] * (response(d) - r0) for d in offers]
+                   for i, (pi, Vi) in enumerate(zip(p, V))])
     n = len(ts)
     A_bud = np.tile(np.array(offers, dtype=float), n)
     # Each customer is one row with five non-zeros. Stored sparse: 0.19 MB, not 922 MB.
@@ -290,6 +312,24 @@ def solve_milp_live(ts, B, offers=(5, 10, 15, 20, 25), base=0.04, slope=0.018, c
             "customers": int(len(al))}
 
 
+def min_detectable_effect(n_per_group, p0, alpha, power_target):
+    """Smallest lift (in probability units) whose power reaches `power_target` at size n."""
+    za, zb = stats.norm.ppf(1 - alpha / 2), stats.norm.ppf(power_target)
+
+    def shortfall(d):
+        p1 = p0 + d
+        var = p0 * (1 - p0) + p1 * (1 - p1)
+        return (za + zb) ** 2 * var / (d ** 2) - n_per_group  # >0 while n is too small
+
+    lo, hi = 1e-4, 0.5
+    if shortfall(hi) > 0:
+        return None
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if shortfall(mid) > 0 else (lo, mid)
+    return (lo + hi) / 2
+
+
 A = load_artifacts()
 tr, te = load_snapshots()
 y_tr = tr["label_churn"]
@@ -298,15 +338,25 @@ cust = A["cust"]
 ts = A["test_scores"]
 OFFER = A["offer_result"]
 BASE_RATE = float(te.label_churn.mean())
+VOTING = A["churn_metrics_df"].loc["Voting (Ch7)"]
+TOP10_PREC = float(VOTING["Prec@10%"])
+TOP10_LIFT = TOP10_PREC / BASE_RATE
+LIST_N = int(A["churn_summary"]["top10_list_size"])
+REPURCHASE_TOP10 = 1.0 - TOP10_PREC
+SENS = A["sensitivity_df"]
+AUC_LO, AUC_HI = float(SENS["AUC (temporal test)"].min()), float(SENS["AUC (temporal test)"].max())
+MEDIAN_ORDERS = int(round(float(cust["Order_Count"].median())))
+CLV_TOP10_SHARE = float(cust["CLV_3Yr"].sort_values(ascending=False)
+                        .head(max(1, len(cust) // 10)).sum() / cust["CLV_3Yr"].sum())
+GAP_PCT = 1.0 - OFFER["greedy_rev"] / OFFER["opt_rev"]
 _top = ts.sort_values("Churn_Prob", ascending=False).head(max(1, len(ts) // 10))
 REV_AT_RISK, N_AT_RISK = float(_top["CLV_3Yr"].sum()), int(len(_top))
 
 # ---------------------------------------------------------------- header
 st.title("Customer Churn Prediction and Retention-Budget Optimization")
-st.caption("Customer Retention Analytics  |  Real e-commerce data  |  Temporal validation  |  Exact MILP budget allocation")
-st.caption("This dashboard follows the analysis notebook step by step. Use the analysis scope "
-           "in the sidebar to choose the modules - churn only, churn plus survival, or churn "
-           "plus optimization plus survival.")
+st.caption("Real e-commerce data · temporal validation · exact MILP budget allocation")
+st.caption("Nine tabs follow the analysis notebook. The sidebar scope selector chooses which "
+           "modules appear.")
 
 tag("BUSINESS PROBLEM")
 st.markdown("Retention is the highest-leverage growth lever in e-commerce. The objective is to "
@@ -316,32 +366,32 @@ st.markdown("Retention is the highest-leverage growth lever in e-commerce. The o
 
 # ---------------------------------------------------------------- sidebar
 st.sidebar.markdown("### Customer Retention Analytics")
-st.sidebar.caption("Churn | Survival | Budget optimization")
+st.sidebar.caption("Churn · Survival · Budget optimization")
 scope = st.sidebar.radio("Analysis scope",
                          ["Churn", "Churn + Survival", "Churn + Optimization + Survival"],
                          index=2,
                          help="Churn shows the binary model. Survival adds time-to-return. "
                               "Optimization adds the budget layer with survival weighting.")
-st.sidebar.markdown(f'<div class="amz-card">'
-                    f'<div class="amz-card-title">Key result</div>'
-                    f'<div class="amz-card-text">5x precision at top 10%. MILP returns 20.2x per '
-                    f'dollar.</div></div>', unsafe_allow_html=True)
+panel("Key result",
+      f"{TOP10_PREC:.0%} of the highest-risk decile churns, {TOP10_LIFT:.1f}x the base rate. "
+      f"The exact allocation returns {OFFER['roas']:.1f}x per dollar.",
+      where=st.sidebar)
 
 with st.sidebar.expander("Data"):
     st.markdown("- Open E-Commerce 1.0 (MIT), 1.76M purchases + 5,027 survey -> 5,013 customers")
     st.markdown("- Train features <= 2022-03-19, test on unseen 2022-09-19")
     st.markdown("- No leakage. Pre-cutoff features. CLV winsorized at p99")
 with st.sidebar.expander("Method"):
-    st.markdown("- Churn = no purchase in N days (90 used, AUC stable 0.87-0.89)")
+    st.markdown(f"- Churn = no purchase in N days (90 used, AUC stable {AUC_LO:.2f}-{AUC_HI:.2f})")
     st.markdown("- Models: Logistic, Trees, RF, GB, XGBoost, Voting")
     st.markdown("- Survival: RSF and Cox model time to return")
     st.markdown("- Offers: exact 0/1-knapsack MILP (HiGHS)")
 with st.sidebar.expander("Scope"):
-    st.markdown("- Panel: US heavy users, median 221 orders")
+    st.markdown(f"- Panel: US heavy users, median {MEDIAN_ORDERS} orders")
     st.markdown("- CLV = annualized spend x 3 (ranking measure)")
     st.markdown("- Response curve assumed, validated by A/B test")
     st.markdown("- Single cross-section, rolling retrain recommended")
-st.sidebar.markdown('<div class="amz-footer">Back to top  |  Retention Analytics  |  2026</div>',
+st.sidebar.markdown('<div class="panel-foot">Retention Analytics  |  2026</div>',
                     unsafe_allow_html=True)
 
 # ---------------------------------------------------------------- tabs (scope-driven)
@@ -373,10 +423,10 @@ with T[IDX["1 · Problem & Data"]]:
 
     tag("CUSTOMER PROFILE")
     st.markdown("The panel consists of US Amazon shoppers recruited through an online survey. "
-                "They are frequent buyers, with a median of 221 orders per customer over the "
-                "observation window. The 90-day churn base rate is 9.9 percent within this "
-                "engaged, high-activity cohort, and the results describe this panel rather than "
-                "occasional shoppers.")
+                f"They are frequent buyers, with a median of {MEDIAN_ORDERS} orders per customer "
+                f"over the observation window. The 90-day churn base rate is {BASE_RATE:.1%} "
+                "within this engaged, high-activity cohort, and the results describe this panel "
+                "rather than occasional shoppers.")
 
     tag("DATA SPLIT (TEMPORAL)")
     c1, c2, c3 = st.columns(3)
@@ -408,15 +458,17 @@ with T[IDX["2 · Exploratory"]]:
                       markers=True, template="plotly_white", labels={"x": "Window", "y": "Churn rate"})
         fig.update_traces(line_color=BLUE, marker_color=BLUE)
         st.plotly_chart(fig, width='stretch')
-        interp("90 days balances catching real churn against ignoring normal gaps.")
+        interp(f"The churn base rate rises with the definition window. 90 days is used because "
+               f"it separates real lapse from a normal purchase gap ({BASE_RATE:.1%} of the test "
+               f"period).")
     with c2:
         tag("VALUE AT STAKE (CLV)")
         fig = px.histogram(cust, x="CLV_3Yr", nbins=40, template="plotly_white",
                            labels={"CLV_3Yr": "3-year CLV ($)"}, color_discrete_sequence=[BLUE])
         fig.update_layout(showlegend=False)
         st.plotly_chart(fig, width='stretch')
-        interp(f"The pool is ${cust['CLV_3Yr'].sum():,.0f} and the top 10% of customers hold 34% "
-               f"of it. Value is concentrated, so retention spend should be too.")
+        interp(f"The pool is ${cust['CLV_3Yr'].sum():,.0f} and the top 10% of customers hold "
+               f"{CLV_TOP10_SHARE:.0%} of it. Value is concentrated, so retention spend should be too.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -557,10 +609,11 @@ with T[IDX["3 · Churn Model"]]:
         st.info("No custom model has been trained yet. The pre-trained benchmark is shown below, "
                 "or set the controls and click Train and Evaluate.")
         cs = A["churn_summary"]
+        ve = voting_test_eval()
         c1, c2, c3, c4 = st.columns(4)
         metric_card(c1, f"{cs['test_customers']:,}", "Customers in test period", "unseen 2022-09-19 window", NAVY)
         metric_card(c2, f"{cs['actual_churned']:,}", "Actually churned", f"base rate {cs['base_rate']:.1%}", RED)
-        metric_card(c3, f"{cs['predicted_churned_05']:,}", "Predicted churned (0.5 cutoff)", "XGBoost on test", AMBER)
+        metric_card(c3, f"{ve['predicted_churned']:,}", "Flagged churn (0.5 cutoff)", "Voting, temporal test", AMBER)
         metric_card(c4, f"{cs['top10_list_size']:,}", "Win-back target list", f"{cs['top10_precision']:.0%} actually churn", GREEN)
         interp(f"Production uses the top-10% list, not the 0.5 cutoff. The list of "
                f"{cs['top10_list_size']:,} highest-risk customers contains "
@@ -574,10 +627,10 @@ with T[IDX["3 · Churn Model"]]:
         tag("FULL ML METRICS (TEMPORAL TEST PERIOD)")
         st.dataframe(bench.style.highlight_max(axis=0), width='stretch')
         interp("All metrics are measured on the unseen test period. The baseline always predicts "
-               "return, so it catches no churners. Lift at 10% compares the top decile with the "
-               "base rate. The Voting ensemble reaches 5x.")
-        cm = voting_test_confusion()
-        tn, fp, fn, tp = cm.ravel()
+               f"return, so it catches no churners. Lift compares the top decile with the base "
+               f"rate, and the Voting ensemble reaches {TOP10_LIFT:.1f}x.")
+        cm = ve["conf"]
+        tn, fp, fn, tp = ve["tn"], ve["fp"], ve["fn"], ve["tp"]
         c1, c2 = st.columns(2)
         c1.markdown("**Confusion matrix (Voting, temporal test)**")
         c1.plotly_chart(px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
@@ -588,15 +641,18 @@ with T[IDX["3 · Churn Model"]]:
         c2.markdown(f"- False positives {fp:,} - returned but flagged churned")
         c2.markdown(f"- False negatives {fn:,} - churned but predicted returned (the miss)")
         c2.markdown(f"- True positives {tp:,} - churned and predicted churned")
-        interp(f"At the 0.5 threshold the model catches {tp:,} of {tp + fn:,} churners. Recall is "
-               f"modest because churn is rare (9.9 percent). Production uses the top-decile "
-               f"ranking instead, where about 49 percent of the targeted customers actually churn.")
+        interp(f"At the 0.5 threshold the model catches {tp:,} of {tp + fn:,} churners, a recall of "
+               f"{ve['recall']:.0%}. Churn is rare ({BASE_RATE:.1%}), so production uses the "
+               f"top-decile ranking instead, where {TOP10_PREC:.0%} of the targeted customers "
+               f"actually churn.")
         bv = train_test_auc()
         st.markdown("**Bias-variance view (train vs test AUC)**")
         st.dataframe(bv, width='stretch')
-        interp("The gap between train and test AUC is the overfit signal. Logistic has almost "
-               "no gap with near-equal test AUC, and the Voting ensemble keeps the best test AUC "
-               "with a moderate gap. Together they cover the bias-variance trade-off.")
+        best = bv.iloc[0]
+        widest = bv.loc[bv["Gap"].idxmax()]
+        interp(f"{best['Model']} has the best test AUC ({best['Test AUC']:.3f}) and "
+               f"{widest['Model']} the widest train-test gap ({widest['Gap']:+.3f}). The gap is "
+               f"the overfit signal, and the table covers the bias-variance trade-off.")
 
         tag("MODEL EQUATION AND FEATURE THRESHOLDS")
         st.markdown("**Churn probability from the logistic model**")
@@ -714,8 +770,8 @@ with T[IDX["4 · Importance"]]:
     sdf = A["sensitivity_df"].copy()
     sdf.columns = ["Churn window (days)", "Base rate (train)", "Base rate (test)", "AUC (temporal test)"]
     st.dataframe(sdf, width='stretch')
-    interp("AUC stays within 0.87-0.89 across 30-180 day definitions. The model is robust to "
-           "the churn cutoff, so 90 days is a defensible choice.")
+    interp(f"AUC stays within {AUC_LO:.2f}-{AUC_HI:.2f} across 30-180 day definitions. The model is "
+           f"robust to the churn cutoff, so 90 days is a defensible choice.")
 
 # ================================================================ 5 (survival, optional)
 if "Survival" in scope:
@@ -729,23 +785,22 @@ if "Survival" in scope:
         sv = A["survival"]
         sp = sv["probs"]
         c1, c2 = st.columns(2)
-        c1.metric("C-index (RSF)", f'{sv["cindex_rsf"]:.3f}',
-                  help="0.5 is random ranking, 1.0 is perfect. How well the survival model "
-                       "ranks time to return.")
-        c2.metric("C-index (Cox)", f'{sv["cindex_cox"]:.3f}',
-                  help="Cox proportional-hazards candidate only as baseline; no PH "
-                       "assumption tested.")
+        metric_card(c1, f'{sv["cindex_rsf"]:.3f}', "C-index (RSF)",
+                    "0.5 random, 1.0 perfect, in-sample", BLUE)
+        metric_card(c2, f'{sv["cindex_cox"]:.3f}', "C-index (Cox)",
+                    "baseline only, PH not tested", GRAY)
         c1, c2 = st.columns(2)
         with c1:
             tag("MEAN LAPSE PROBABILITY BY HORIZON")
             means = sp[[f"S_{h}" for h in sv["horizons"]]].mean()
+            s90 = float(means["S_90"])
             fig = px.line(x=[f"{h}d" for h in sv["horizons"]], y=means.values, markers=True,
                           template="plotly_white", labels={"x": "Horizon", "y": "Mean S(t)"})
             fig.update_traces(line_color=BLUE, marker_color=BLUE)
             st.plotly_chart(fig, width='stretch')
-            interp("S(90) is 0.11, matching the binary 90-day churn rate of 9.9 percent. The "
-                   "two views agree, and the survival curve adds the time dimension (its "
-                   "c-index is in-sample only, see the caveat above).")
+            interp(f"S(90) is {s90:.2f}, against a binary 90-day churn rate of {BASE_RATE:.1%}. "
+                   f"The two views agree, and the survival curve adds the time dimension (its "
+                   f"c-index is in-sample only, see the caveat above).")
         with c2:
             tag("EXPECTED DAYS TO RETURN (URGENCY)")
             fig = px.histogram(sp, x="Expected_Days_To_Return", nbins=30, template="plotly_white",
@@ -765,8 +820,8 @@ with T[IDX["6 · Segments"]]:
     doing("Natural customer groups are derived from behaviour via principal components and "
           "K-Means, then named from their actual profiles.")
     k_choice = st.selectbox("Number of segments (k)", [3, 4, 5, 6], index=1,
-                            help="4 is validated with silhouette near 0.22. Higher k gives finer "
-                                 "groups but softer boundaries.")
+                            help="Higher k gives finer groups but softer boundaries. The "
+                                 "silhouette below shows how well separated the chosen k is.")
 
     seg_feats = ["Total_Spend_USD", "Order_Count", "Avg_Order_Value_USD", "Orders_Per_Year",
                  "Active_Months", "Category_Count", "Recency_Days", "entertainment_share", "ott_flag",
@@ -804,18 +859,22 @@ with T[IDX["6 · Segments"]]:
         Freq=("Orders_Per_Year", "mean"), ActiveM=("Active_Months", "mean"),
         Ent=("entertainment_share", "mean"), OTT=("ott_flag", "mean"), Recency=("Recency_Days", "mean")).round(2)
     order = prof.sort_values("CLV", ascending=False).index
-    tiers = ["High-Value Loyalists", "Established Shoppers", "Occasional Shoppers", "Light / Disengaged",
-             "Casual / New", "Inactive"]
-    seg_map = {idx: tiers[i] if i < len(tiers) else f"Segment {idx}" for i, idx in enumerate(order)}
+    # Clusters are ordered by mean CLV and labelled by rank only. Inventing a business name
+    # such as a loyalty tier from that rank implies a reading the clustering never
+    # established, and the same names would appear at every k.
+    seg_map = {idx: f"Segment {i + 1}" for i, idx in enumerate(order)}
     prof = prof.rename(index=seg_map).sort_values("CLV", ascending=False)
+    sil_k = float(silhouette_score(pca6, km.labels_))
 
     c1, c2 = st.columns(2)
-    c1.metric("Segments", f"k = {k_choice}",
-              f"silhouette {__import__('sklearn.metrics', fromlist=['silhouette_score']).silhouette_score(pca6, km.labels_):.3f}")
-    c2.metric("Total 3-yr value pool", f"${cust['CLV_3Yr'].sum():,.0f}")
+    metric_card(c1, f"k = {k_choice}", "Segments", f"silhouette {sil_k:.3f}", BLUE)
+    metric_card(c2, f"${cust['CLV_3Yr'].sum():,.0f}", "Total 3-yr value pool",
+                f"across {len(cust):,} customers", GREEN)
     st.dataframe(prof, width='stretch')
-    interp("High-Value Loyalists are few and worth the most. Light / Disengaged is the largest "
-           "risk pool. Occasional shoppers are the cross-sell opportunity.")
+    biggest = prof["n"].idxmax()
+    interp(f"Segments are ordered by mean CLV, and the labels carry no meaning beyond that rank. "
+           f"{biggest} holds the most customers ({prof.loc[biggest, 'n']:,.0f}), while Segment 1 "
+           f"holds the highest value per customer (${prof.loc['Segment 1', 'CLV']:,.0f}).")
 
     overlay = (cust.assign(Cluster=km.labels_)[["Customer_ID", "Cluster"]]
                .merge(A["test_scores"][["Customer_ID", "Churn_Prob", "CLV_3Yr"]], on="Customer_ID", how="inner")
@@ -826,6 +885,8 @@ with T[IDX["6 · Segments"]]:
         lambda s: (s * overlay.loc[s.index, "CLV_3Yr"].fillna(0)).sum()).round(0)
     st.markdown("**Churn risk and value at risk by segment**")
     st.dataframe(sc, width='stretch')
+    st.caption(f"Computed on the {len(overlay):,} test-period customers that carry a churn score, "
+               f"not the full {len(cust):,}-customer table.")
     interp("Value at risk is churn probability times CLV, summed per segment. It is the dollar "
            "exposure each segment represents.")
 
@@ -862,9 +923,6 @@ with T[IDX["7 · Optimizer (MILP)"]]:
     else:
         ts_off["urgency"] = 1.0
 
-    def response(d, base=0.04, slope=0.018, cap=0.60):
-        return float(np.clip(base + slope * d, 0.0, cap))
-
     precomputed = OFFER["milp_by_budget"][int(B)]
     if use_surv:
         solved = st.session_state.setdefault("milp_surv", {})
@@ -881,47 +939,37 @@ with T[IDX["7 · Optimizer (MILP)"]]:
     else:
         m = precomputed
 
-    # greedy + naive for the selected mode (fast, live)
-    _p = ts_off["Churn_Prob"].to_numpy()
-    _V = ts_off["CLV_3Yr"].to_numpy()
-    _U = ts_off["urgency"].to_numpy()
-    _d = np.array([5, 10, 15, 20, 25], dtype=float)
-    _resp = np.clip(0.04 + 0.018 * _d, 0.0, 0.60) - 0.04
-    _incr = (_p * _V * _U)[:, None] * _resp[None, :]
-    _ratio = _incr / _d[None, :]
-    _mask_any = _incr > 0
-    _ratio = np.where(_mask_any, _ratio, 0.0)
-    _best_k = _ratio.argmax(axis=1)
-    _row_idx = np.arange(len(_p))
-    _best_offer = np.where(_ratio[_row_idx, _best_k] > 0, _d[_best_k], 0.0)
-    _best_incr = np.where(_ratio[_row_idx, _best_k] > 0, _incr[_row_idx, _best_k], 0.0)
-    gdf = pd.DataFrame({"Offer_USD": _best_offer, "Incr_Retained_Rev": _best_incr})
-    gdf = gdf[gdf.Offer_USD > 0].sort_values("Incr_Retained_Rev", ascending=False)
-    gc = gdf.Offer_USD.cumsum().values
-    gr = gdf.Incr_Retained_Rev.cumsum().values
-    rc = gdf.sort_values("Offer_USD").Offer_USD.cumsum().values
-    rr = gdf.sort_values("Offer_USD").Incr_Retained_Rev.cumsum().values
-    kg = int(np.searchsorted(gc, B, side="right"))
-    kn = int(np.searchsorted(rc, B, side="right"))
-    greedy_rev = gr[kg - 1] if kg > 0 else 0.0
-    naive_rev = rr[kn - 1] if kn > 0 else 0.0
+    # Comparison benchmarks come from the same artifact curve the chart below draws, so the
+    # cards and the amber/red lines cannot disagree. The live recomputation of the cheapest-
+    # first benchmark was deleted: it produced $67,520 at $10k against the $8,385 recorded in
+    # the artifact, and the published artifact is the single source of truth.
+    cv = OFFER["curve"]
+    _rows = cv.loc[cv["Budget_USD"] == int(B)]
+    if _rows.empty:  # the slider only lands on the grid, but never fail on a stray value
+        _rows = cv.iloc[[int(np.argmin(np.abs(cv["Budget_USD"] - B)))]]
+    _row = _rows.iloc[0]
+    greedy_rev = float(_row["Retained_Rev_Greedy"])
+    naive_rev = float(_row["Retained_Rev_CheapestFirst"])
 
     c1, c2, c3, c4 = st.columns(4)
     metric_card(c1, f"${m['rev']:,.0f}", "Retained value (MILP)", f"ROAS {m['roas']:.1f}x", GREEN)
-    metric_card(c2, f"${greedy_rev:,.0f}", "Greedy heuristic", "value per dollar ordering", AMBER)
-    metric_card(c3, f"${naive_rev:,.0f}", "Naive spend", "cheapest first", RED)
+    metric_card(c2, f"${greedy_rev:,.0f}", "Greedy heuristic",
+                "binary baseline" if use_surv else "value per dollar ordering", AMBER)
+    metric_card(c3, f"${naive_rev:,.0f}", "Naive spend",
+                "binary baseline" if use_surv else "cheapest first", RED)
     metric_card(c4, f"{m['customers']:,}", "Customers offered", "at the optimum", BLUE)
     interp(f"The optimum protects ${m['rev']:,.0f}, which is {m['roas']:.1f}x per dollar, versus "
            f"${greedy_rev:,.0f} for the greedy and ${naive_rev:,.0f} for naive spend. "
            + ("Survival weighting is active, so high-value customers with the highest "
                "no-return probability are prioritised." if use_surv else "The binary-model probability is used."))
-    st.caption("These figures are read from the precomputed artifact (train_models.py), using "
-               "voting-ensemble probabilities - the same scoring as the executed notebook, so "
-               "at a $10,000 budget both report the identical figure ($202,403 retained, ROAS "
-               "20.2x, greedy $80,543, naive $8,385). Survival weighting is solved on request. "
-               "ROAS is a projection of the assumed response curve, not a measured return.")
+    st.caption(f"At the artifact's reference budget of "
+               f"${OFFER['budget']:,.0f}, the precomputed optimum retains "
+               f"${OFFER['opt_rev']:,.0f} at {OFFER['roas']:.1f}x against "
+               f"${OFFER['greedy_rev']:,.0f} for greedy and ${OFFER['rand_rev']:,.0f} for naive "
+               f"spend. Figures are read from the artifact scored by train_models.py with "
+               f"voting-ensemble probabilities. Survival weighting is solved on request. ROAS "
+               f"is a projection of the assumed response curve, not a measured return.")
 
-    cv = OFFER["curve"]
     fig = px.line(cv, x="Budget_USD", y="Retained_Rev_MILP", markers=True, template="plotly_white",
                   labels={"Budget_USD": "Budget ($)", "Retained_Rev_MILP": "Retained value ($)"},
                   title="Retained value vs budget (binary-probability baseline)")
@@ -942,16 +990,16 @@ with T[IDX["7 · Optimizer (MILP)"]]:
         st.latex(r"\text{s.t.} \; \sum_{d} x_{i,d} \le 1 \; \forall i, \quad "
                  r"\sum_{i} \sum_{d} d\, x_{i,d} \le B, \quad x_{i,d} \in \{0,1\}")
         st.markdown("**Expected retained value and the response assumption**")
+        _base, _slope, _cap = RESPONSE["base"], RESPONSE["slope"], RESPONSE["cap"]
         st.latex(r"\Delta V_i(d) = p_i \cdot V_i \cdot u_i \cdot (r(d) - r(0)), \qquad "
-                 r"r(d) = \min(0.60,\; 0.04 + 0.018\,d)")
+                 rf"r(d) = \min({_cap:.2f},\; {_base:.2f} + {_slope:.3f}\,d)")
         st.caption("p_i is the churn probability (binary or survival S(90)), u_i is the urgency "
                    "weight S(30) when survival mode is on. Solved with HiGHS via "
                    "scipy.optimize.milp. The response curve is an assumption to be validated by "
                    "A/B test.")
 
     st.markdown("**Priority win-back list (exact MILP allocation)**")
-    shown = m["allocation"].head(m["customers"])
-    st.dataframe(shown[["Customer_ID", "Churn_Prob", "CLV_3Yr", "Offer_USD", "Incr_Retained_Rev"]]
+    st.dataframe(m["allocation"][["Customer_ID", "Churn_Prob", "CLV_3Yr", "Offer_USD", "Incr_Retained_Rev"]]
                  .rename(columns={"Incr_Retained_Rev": "Expected retained $"}).reset_index(drop=True),
                  width='stretch', height=320)
     interp("These customers are contacted first. The table shows risk, value at stake, and the "
@@ -965,14 +1013,18 @@ with T[IDX["8 · A/B Test"]]:
     doing("The win-back experiment is designed with a two-proportion z-test. Sample size and "
           "power are computed from the hypotheses, and the mathematics is shown below.")
     c1, c2, c3 = st.columns(3)
-    p0 = c1.slider("Baseline 90-day repurchase rate", 0.30, 0.95, 0.52, 0.01,
-                   help="0.52 is the top-decile high-risk cohort. 0.90 is all customers.")
-    mde = c2.slider("Minimum detectable effect (pp)", 2, 20, 10, 1)
+    p0_default = float(round(REPURCHASE_TOP10, 2))
+    p0 = c1.slider("Baseline 90-day repurchase rate", 0.30, 0.95, p0_default, 0.01,
+                   help=f"{p0_default:.0%} is the top-decile high-risk cohort, one minus its "
+                        f"churn rate. 0.90 approximates all customers.")
+    mde_max = max(2, min(20, int(round((1 - p0) * 100)) - 1))
+    mde = c2.slider("Minimum detectable effect (pp)", 2, mde_max, min(10, mde_max), 1,
+                    help="Capped so that the lifted rate p0 + effect stays below 100%.")
     alpha = c3.slider("Significance level alpha", 0.01, 0.10, 0.05, 0.01)
     c4, c5 = st.columns(2)
     pwr_target = c4.slider("Power target", 0.50, 0.95, 0.80, 0.05)
-    n_avail = c5.slider("Customers per group available", 50, 800, 242, 10,
-                        help="242 is half of the 485-customer top-decile list.")
+    n_avail = c5.slider("Customers per group available", 50, 800, max(50, LIST_N // 2), 10,
+                        help=f"{LIST_N // 2} is half of the {LIST_N}-customer top-decile list.")
 
     za = stats.norm.ppf(1 - alpha / 2)
     zb = stats.norm.ppf(pwr_target)
@@ -985,20 +1037,29 @@ with T[IDX["8 · A/B Test"]]:
     metric_card(c2, f"{pow_avail:.0%}", "Power at available sample", f"{n_avail:,} per group", GREEN if pow_avail >= pwr_target else AMBER)
     metric_card(c3, f"+{mde}pp", "Minimum detectable effect", f"from {p0:.0%} baseline", BLUE)
     metric_card(c4, f"{p1 - p0:+.0%}", "Effect under H1", f"p1 = {p1:.1%}", GRAY)
-    interp(f"At {n_avail:,} customers per group the design detects a +{mde}pp lift with "
-           f"{pow_avail:.0%} power. The current top-decile list, 242 per group, reaches the "
-           f"power target only for lifts around +12pp, so the rollout may need the top three "
-           f"deciles, about 1,455 customers, or a directional read.")
 
-    mdes = np.arange(0.02, 0.20, 0.005)
+    smallest = min_detectable_effect(n_avail, p0, alpha, pwr_target)
+    if smallest is None:
+        reach = f"no lift up to 50pp reaches {pwr_target:.0%} power at this sample"
+    else:
+        reach = (f"the smallest lift that reaches {pwr_target:.0%} power is "
+                 f"+{smallest * 100:.1f}pp")
+    interp(f"At {n_avail:,} customers per group the design detects a +{mde}pp lift with "
+           f"{pow_avail:.0%} power, and {reach}. The top-decile list supplies {LIST_N // 2:,} "
+           f"per group; the top three deciles would supply {3 * LIST_N // 2:,} per group "
+           f"({3 * LIST_N:,} customers) if a smaller lift has to be resolved.")
+
+    mdes = np.arange(0.02, min(0.20, 0.99 - p0) + 0.005, 0.005)
     pow_curve = [stats.norm.cdf(np.sqrt(n_avail * d ** 2 / (p0 * (1 - p0) + (p0 + d) * (1 - p0 - d))) - za) for d in mdes]
     fig = px.line(x=mdes * 100, y=pow_curve, markers=True, template="plotly_white",
                   labels={"x": "Minimum detectable effect (pp)", "y": "Power"})
     fig.update_traces(line_color=BLUE, marker_color=BLUE, name="Power at available sample")
     fig.add_hline(y=pwr_target, line_dash="dash", line_color=RED)
     st.plotly_chart(fig, width='stretch')
-    interp("The curve shows the detectable effect at the available sample size. The red line "
-           "is the power target.")
+    interp(f"Power rises with the size of the lift. At {n_avail:,} per group the curve crosses "
+           f"the {pwr_target:.0%} target at about +{smallest * 100:.1f}pp."
+           if smallest is not None else
+           f"Power never reaches the {pwr_target:.0%} target at {n_avail:,} per group.")
 
     n_curve = [(d, int(np.ceil(((stats.norm.ppf(1 - alpha / 2) + stats.norm.ppf(pwr_target)) ** 2
                   * (p0 * (1 - p0) + (p0 + d) * (1 - p0 - d))) / d ** 2))) for d in mdes]
@@ -1007,12 +1068,13 @@ with T[IDX["8 · A/B Test"]]:
     fig2.update_traces(line_color=GREEN, marker_color=GREEN)
     fig2.add_hline(y=n_avail, line_dash="dash", line_color=NAVY)
     st.plotly_chart(fig2, width='stretch')
-    interp("The required sample falls steeply as the detectable effect grows. The navy line is "
-           "the available sample.")
+    interp(f"Resolving the configured +{mde}pp lift requires {n_req:,} per group, against "
+           f"{n_avail:,} available, so the design is "
+           f"{'adequately' if n_avail >= n_req else 'under'}powered at that effect.")
 
     with st.expander("A/B test mathematics"):
-        st.markdown("**Hypotheses** (one-sided, outcome is the 90-day repurchase rate p)")
-        st.latex(r"H_0: p_T - p_C \le 0 \qquad H_1: p_T - p_C = \delta > 0")
+        st.markdown("**Hypotheses** (two-sided, outcome is the 90-day repurchase rate p)")
+        st.latex(r"H_0: p_T - p_C = 0 \qquad H_1: p_T - p_C \ne 0")
         st.markdown("**Sample size per group** (two-proportion z-test)")
         st.latex(r"n = \frac{(z_{\alpha/2} + z_\beta)^2\,(p_0(1-p_0) + p_1(1-p_1))}{(p_1 - p_0)^2}")
         st.markdown("**Power at a given sample size**")
@@ -1036,15 +1098,16 @@ with T[IDX["9 · Recommendations"]]:
     tag("RECOMMENDATIONS")
     recs = [
         ("P1", "Deploy the weekly churn score in the CRM",
-         f"the top-10% list ({N_AT_RISK:,} customers, ${REV_AT_RISK:,.0f} at risk) is routed to "
-         f"the win-back workflow. About 49% would churn without intervention."),
+         f"the top decile of scored customers ({N_AT_RISK:,} customers, ${REV_AT_RISK:,.0f} at "
+         f"risk) is routed to the win-back workflow. {TOP10_PREC:.0%} of that list churns "
+         f"without intervention, {TOP10_LIFT:.1f}x the base rate."),
         ("P1", "Replace blanket discounts with the MILP allocation",
          f"at a ${OFFER['budget']:,.0f} budget the exact allocation retains "
          f"${OFFER['opt_rev']:,.0f} with ROAS {OFFER['roas']:.1f}x, which is "
-         f"${OFFER['opt_rev']-OFFER['rand_rev']:,.0f} more than naive spend."),
-        ("P2", "Tier the win-back by segment",
-         "premium offers for at-risk High-Value Loyalists, low-cost coupons for Light / Disengaged, "
-         "and category cross-sell for Occasional shoppers."),
+         f"${OFFER['opt_rev'] - OFFER['rand_rev']:,.0f} more than naive spend."),
+        ("P2", "Tier the win-back by value segment",
+         f"larger offers for Segment 1, the highest value per customer, down to small coupons "
+         f"for the lowest-CLV segment, with category cross-sell between them."),
         ("P2", "Add CX early-warning triggers",
          "a declining average order value or recency above 60 days flags a customer weeks before "
          "the 90-day silence."),
@@ -1057,26 +1120,27 @@ with T[IDX["9 · Recommendations"]]:
     ]
     for p, t, d in recs:
         color = {"P1": RED, "P2": AMBER, "P3": GRAY}[p]
-        st.markdown(f'<div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;'
-                    f'padding:8px 12px;margin:5px 0;font-size:.95rem;">'
-                    f'<b style="color:{color}">{p}</b> &nbsp;<b>{t}</b> - {d}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="panel" style="border-left-color:{color}">'
+                    f'<div class="panel-title" style="color:{color}">{p}</div>'
+                    f'<div class="panel-text"><b>{t}</b> - {d}</div></div>',
+                    unsafe_allow_html=True)
 
     tag("ANALYTICAL RIGOR")
     st.markdown("- Temporal validation. The model is evaluated on a future period it never saw, "
                 "with no censored outcomes.")
     st.markdown("- No leakage. Features use only pre-cutoff orders and the churn window is "
-                "sensitivity-tested (AUC 0.87-0.89).")
+                f"sensitivity-tested (AUC {AUC_LO:.2f}-{AUC_HI:.2f}).")
     st.markdown("- Multicollinearity is checked with VIF; drivers are confirmed by MDI, "
                 "permutation, SHAP and logistic odds.")
     st.markdown("- Survival analysis handles censoring and adds time-to-return urgency (the "
                 "c-index is in-sample only - train/test cohort and outcome windows overlap).")
-    st.markdown("- The greedy heuristic was measured about 60% below the MILP optimum in the "
-                "executed notebook. The exact solver is used.")
+    st.markdown(f"- The greedy heuristic was measured {GAP_PCT:.0%} below the MILP optimum in the "
+                f"executed notebook. The exact solver is used.")
     st.markdown("- The offer-response curve is an assumption. The A/B test is the causal upgrade.")
 
     tag("LIMITATIONS")
-    st.markdown("- The panel is survey-recruited heavy users (median 221 orders). Rates may not "
-                "generalize to all shoppers.")
+    st.markdown("- The panel is survey-recruited heavy users (median "
+                f"{MEDIAN_ORDERS} orders). Rates may not generalize to all shoppers.")
     st.markdown("- CLV is a velocity proxy (annualized spend x 3) and a ranking measure.")
     st.markdown("- Survival horizons are capped by the data end (2023-03-19); long-horizon "
                 "estimates are less certain.")
@@ -1085,11 +1149,14 @@ with T[IDX["9 · Recommendations"]]:
     tag("GLOSSARY")
     for term, defn in [("Churn", "no purchase within 90 days."),
                        ("ROC-AUC", "how well churners are separated from stayers. 0.9 is excellent."),
-                       ("Precision at top 10%", "share of contacted top-decile customers who actually churn. About 49%, or 5x the base rate."),
+                       ("Precision at top 10%",
+                        f"share of contacted top-decile customers who actually churn. "
+                        f"{TOP10_PREC:.0%}, or {TOP10_LIFT:.1f}x the base rate."),
                        ("CLV (3-yr)", "annualized spend x 3. The dollars at stake."),
-                       ("ROAS", "retained value per 1 dollar of offer spend. About 20.2x in the "
-                                 "executed-notebook run - a projection of the assumed response "
-                                 "curve, not a measured return (live re-solves can differ)."),
+                       ("ROAS", f"retained value per 1 dollar of offer spend. {OFFER['roas']:.1f}x "
+                                f"in the executed-notebook run, a projection of the assumed "
+                                f"response curve rather than a measured return (live re-solves "
+                                f"can differ)."),
                        ("MILP", "Mixed-Integer Linear Program. Exact optimization via HiGHS."),
                        ("Survival S(t)", "probability a customer has NOT returned by day t "
                         "(no-return probability). S(90) is the 90-day no-return probability."),
