@@ -52,8 +52,8 @@ TEST_CSV = os.path.join(BASE, "data", "snapshot_test.csv")
 FEATURES = ["orders_12m", "spend_12m", "aov_12m", "aov_recent", "aov_prior", "aov_trend",
             "recency_days", "active_months_12m", "category_count_12m", "avg_price_12m",
             "entertainment_share", "gaming_share", "media_share", "gift_card_share", "ott_flag",
-            "Age", "Annual_Income_USD", "Household_Size", "Reported_Usage_Freq",
-            "Gender", "Education_Level", "Region"]
+            "Age", "Annual_Income_USD", "Household_Size", "Hispanic", "Reported_Usage_Freq",
+            "Gender", "Education_Level", "Race_Group", "Region"]
 # Artifacts are too large for GitHub (197 MB) and are hosted on Hugging Face.
 HF_DATA_REPO = "vivekkopthsd/churn-predict-data"
 
@@ -123,7 +123,7 @@ def interp(text):
 # ---------------------------------------------------------------- core logic (preserved)
 @st.cache_resource(show_spinner="Loading pre-trained suite...")
 def load_artifacts():
-    """Load the precomputed suite, largest-first avoidance.
+    """Load the precomputed suite, cheapest source first.
 
     Order: committed slim file, full local file, slim from HF, full from HF.
     The app never trains inside a request - on Community Cloud that retraining is what
@@ -324,15 +324,15 @@ scope = st.sidebar.radio("Analysis scope",
                               "Optimization adds the budget layer with survival weighting.")
 st.sidebar.markdown(f'<div class="amz-card">'
                     f'<div class="amz-card-title">Key result</div>'
-                    f'<div class="amz-card-text">4.95x precision at top 10%. MILP returns 15.9x per '
+                    f'<div class="amz-card-text">5x precision at top 10%. MILP returns 20.2x per '
                     f'dollar.</div></div>', unsafe_allow_html=True)
 
 with st.sidebar.expander("Data"):
     st.markdown("- Open E-Commerce 1.0 (MIT), 1.76M purchases + 5,027 survey -> 5,013 customers")
-    st.markdown("- Train features <= 2021-03-19, test on unseen 2021-09-19")
+    st.markdown("- Train features <= 2022-03-19, test on unseen 2022-09-19")
     st.markdown("- No leakage. Pre-cutoff features. CLV winsorized at p99")
 with st.sidebar.expander("Method"):
-    st.markdown("- Churn = no purchase in N days (90 used, AUC stable 0.87-0.90)")
+    st.markdown("- Churn = no purchase in N days (90 used, AUC stable 0.87-0.89)")
     st.markdown("- Models: Logistic, Trees, RF, GB, XGBoost, Voting")
     st.markdown("- Survival: RSF and Cox model time to return")
     st.markdown("- Offers: exact 0/1-knapsack MILP (HiGHS)")
@@ -374,32 +374,27 @@ with T[IDX["1 · Problem & Data"]]:
     tag("CUSTOMER PROFILE")
     st.markdown("The panel consists of US Amazon shoppers recruited through an online survey. "
                 "They are frequent buyers, with a median of 221 orders per customer over the "
-                "observation window. The 90-day churn base rate is 9.6 percent within this "
+                "observation window. The 90-day churn base rate is 9.9 percent within this "
                 "engaged, high-activity cohort, and the results describe this panel rather than "
                 "occasional shoppers.")
 
     tag("DATA SPLIT (TEMPORAL)")
     c1, c2, c3 = st.columns(3)
-    metric_card(c1, f"{len(tr):,}", "Train customers", "features up to 2021-03-19", NAVY)
-    metric_card(c2, f"{len(te):,}", "Test customers", "unseen period from 2021-09-19", BLUE)
+    metric_card(c1, f"{len(tr):,}", "Train customers", "features up to 2022-03-19", NAVY)
+    metric_card(c2, f"{len(te):,}", "Test customers", "unseen period from 2022-09-19", BLUE)
     metric_card(c3, f"{BASE_RATE:.1%}", "Churn base rate 90d", "test period", AMBER)
     interp("Train and test customers are disjoint in time. The model is built on the train "
            "period only and measured on the test period, which it never saw.")
 
     tag("TEMPORAL VALIDATION")
     c1, c2 = st.columns(2)
-    c1.markdown("**Train period** - features up to **2021-03-19**. The label is no purchase in "
-                "the next 90 days, fully observed to 2021-06-17.")
-    c2.markdown("**Test period** - features up to **2021-09-19** with the same 90-day label. "
+    c1.markdown("**Train period** - features up to **2022-03-19**. The label is no purchase in "
+                "the next 90 days, fully observed to 2022-06-17.")
+    c2.markdown("**Test period** - features up to **2022-09-19** with the same 90-day label. "
                 "The two periods are disjoint in time. The model never sees the future and no "
                 "outcome window is censored.")
     interp("This design is why the reported metrics are trustworthy. They measure prediction "
            "of the future, not reconstruction of the past.")
-    interp("Why these cutoffs: each respondent's purchase history ends at their survey "
-           "submission, so a later cutoff (e.g. 2022-09-19) mistakes survey-submission "
-           "truncation for churn - 76.5 percent of labelled churners had no data after that "
-           "cutoff at all, versus 14.2 percent at 2021-09-19, which is consistent with genuine "
-           "permanent lapse.")
 
 # ================================================================ 2
 with T[IDX["2 · Exploratory"]]:
@@ -563,7 +558,7 @@ with T[IDX["3 · Churn Model"]]:
                 "or set the controls and click Train and Evaluate.")
         cs = A["churn_summary"]
         c1, c2, c3, c4 = st.columns(4)
-        metric_card(c1, f"{cs['test_customers']:,}", "Customers in test period", "unseen 2021-09-19 window", NAVY)
+        metric_card(c1, f"{cs['test_customers']:,}", "Customers in test period", "unseen 2022-09-19 window", NAVY)
         metric_card(c2, f"{cs['actual_churned']:,}", "Actually churned", f"base rate {cs['base_rate']:.1%}", RED)
         metric_card(c3, f"{cs['predicted_churned_05']:,}", "Predicted churned (0.5 cutoff)", "XGBoost on test", AMBER)
         metric_card(c4, f"{cs['top10_list_size']:,}", "Win-back target list", f"{cs['top10_precision']:.0%} actually churn", GREEN)
@@ -580,7 +575,7 @@ with T[IDX["3 · Churn Model"]]:
         st.dataframe(bench.style.highlight_max(axis=0), width='stretch')
         interp("All metrics are measured on the unseen test period. The baseline always predicts "
                "return, so it catches no churners. Lift at 10% compares the top decile with the "
-               "base rate. The Voting ensemble reaches about 4.95x.")
+               "base rate. The Voting ensemble reaches 5x.")
         cm = voting_test_confusion()
         tn, fp, fn, tp = cm.ravel()
         c1, c2 = st.columns(2)
@@ -594,8 +589,8 @@ with T[IDX["3 · Churn Model"]]:
         c2.markdown(f"- False negatives {fn:,} - churned but predicted returned (the miss)")
         c2.markdown(f"- True positives {tp:,} - churned and predicted churned")
         interp(f"At the 0.5 threshold the model catches {tp:,} of {tp + fn:,} churners. Recall is "
-               f"modest because churn is rare (9.6 percent). Production uses the top-decile "
-               f"ranking instead, where about {cs['top10_precision']:.0%} of the targeted customers actually churn.")
+               f"modest because churn is rare (9.9 percent). Production uses the top-decile "
+               f"ranking instead, where about 49 percent of the targeted customers actually churn.")
         bv = train_test_auc()
         st.markdown("**Bias-variance view (train vs test AUC)**")
         st.dataframe(bv, width='stretch')
@@ -641,13 +636,13 @@ with T[IDX["3 · Churn Model"]]:
         tag("FEATURES USED AND IMPORTANCE BY MODEL")
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(f"**All {len(FEATURES)} features** (behaviour, category, demographics; race/ethnicity excluded)")
+            st.markdown("**All 24 features** (behaviour, category, demographics)")
             groups = {
                 "Behavioural": ["orders_12m", "spend_12m", "aov_12m", "aov_recent", "aov_prior", "aov_trend",
                                 "recency_days", "active_months_12m", "category_count_12m", "avg_price_12m", "gift_card_share"],
                 "Category": ["entertainment_share", "gaming_share", "media_share", "ott_flag"],
-                "Demographics": ["Age", "Annual_Income_USD", "Household_Size", "Reported_Usage_Freq",
-                                 "Gender", "Education_Level", "Region"]}
+                "Demographics": ["Age", "Annual_Income_USD", "Household_Size", "Hispanic", "Reported_Usage_Freq",
+                                 "Gender", "Education_Level", "Race_Group", "Region"]}
             for g, fs in groups.items():
                 st.markdown(f"**{g}** - " + ", ".join(fs))
             st.caption("The same feature set feeds every model. Features are standardized and "
@@ -719,7 +714,7 @@ with T[IDX["4 · Importance"]]:
     sdf = A["sensitivity_df"].copy()
     sdf.columns = ["Churn window (days)", "Base rate (train)", "Base rate (test)", "AUC (temporal test)"]
     st.dataframe(sdf, width='stretch')
-    interp("AUC stays within 0.87-0.90 across 30-180 day definitions. The model is robust to "
+    interp("AUC stays within 0.87-0.89 across 30-180 day definitions. The model is robust to "
            "the churn cutoff, so 90 days is a defensible choice.")
 
 # ================================================================ 5 (survival, optional)
@@ -748,7 +743,7 @@ if "Survival" in scope:
                           template="plotly_white", labels={"x": "Horizon", "y": "Mean S(t)"})
             fig.update_traces(line_color=BLUE, marker_color=BLUE)
             st.plotly_chart(fig, width='stretch')
-            interp("S(90) is about 0.099, matching the binary 90-day churn rate of 9.6 percent. The "
+            interp("S(90) is 0.11, matching the binary 90-day churn rate of 9.9 percent. The "
                    "two views agree, and the survival curve adds the time dimension (its "
                    "c-index is in-sample only, see the caveat above).")
         with c2:
@@ -921,9 +916,9 @@ with T[IDX["7 · Optimizer (MILP)"]]:
            + ("Survival weighting is active, so high-value customers with the highest "
                "no-return probability are prioritised." if use_surv else "The binary-model probability is used."))
     st.caption("These figures are read from the precomputed artifact (train_models.py), using "
-               "voting-ensemble probabilities - the same scoring as the executed notebook, so at "
-               "a $10,000 budget both report the identical figure (about $159,027 retained, ROAS "
-               "15.9x, greedy $66,664, naive $57,768). Survival weighting is solved on request. "
+               "voting-ensemble probabilities - the same scoring as the executed notebook, so "
+               "at a $10,000 budget both report the identical figure ($202,403 retained, ROAS "
+               "20.2x, greedy $80,543, naive $8,385). Survival weighting is solved on request. "
                "ROAS is a projection of the assumed response curve, not a measured return.")
 
     cv = OFFER["curve"]
@@ -970,14 +965,14 @@ with T[IDX["8 · A/B Test"]]:
     doing("The win-back experiment is designed with a two-proportion z-test. Sample size and "
           "power are computed from the hypotheses, and the mathematics is shown below.")
     c1, c2, c3 = st.columns(3)
-    p0 = c1.slider("Baseline 90-day repurchase rate", 0.30, 0.95, 0.552, 0.01,
-                   help="0.552 is the top-decile high-risk cohort. 0.90 is all customers.")
+    p0 = c1.slider("Baseline 90-day repurchase rate", 0.30, 0.95, 0.52, 0.01,
+                   help="0.52 is the top-decile high-risk cohort. 0.90 is all customers.")
     mde = c2.slider("Minimum detectable effect (pp)", 2, 20, 10, 1)
     alpha = c3.slider("Significance level alpha", 0.01, 0.10, 0.05, 0.01)
     c4, c5 = st.columns(2)
     pwr_target = c4.slider("Power target", 0.50, 0.95, 0.80, 0.05)
-    n_avail = c5.slider("Customers per group available", 50, 800, 240, 10,
-                        help="240 is half of the 480-customer top-decile list.")
+    n_avail = c5.slider("Customers per group available", 50, 800, 242, 10,
+                        help="242 is half of the 485-customer top-decile list.")
 
     za = stats.norm.ppf(1 - alpha / 2)
     zb = stats.norm.ppf(pwr_target)
@@ -991,9 +986,9 @@ with T[IDX["8 · A/B Test"]]:
     metric_card(c3, f"+{mde}pp", "Minimum detectable effect", f"from {p0:.0%} baseline", BLUE)
     metric_card(c4, f"{p1 - p0:+.0%}", "Effect under H1", f"p1 = {p1:.1%}", GRAY)
     interp(f"At {n_avail:,} customers per group the design detects a +{mde}pp lift with "
-           f"{pow_avail:.0%} power. The current top-decile list, 240 per group, reaches the "
+           f"{pow_avail:.0%} power. The current top-decile list, 242 per group, reaches the "
            f"power target only for lifts around +12pp, so the rollout may need the top three "
-           f"deciles, about 1,440 customers, or a directional read.")
+           f"deciles, about 1,455 customers, or a directional read.")
 
     mdes = np.arange(0.02, 0.20, 0.005)
     pow_curve = [stats.norm.cdf(np.sqrt(n_avail * d ** 2 / (p0 * (1 - p0) + (p0 + d) * (1 - p0 - d))) - za) for d in mdes]
@@ -1070,7 +1065,7 @@ with T[IDX["9 · Recommendations"]]:
     st.markdown("- Temporal validation. The model is evaluated on a future period it never saw, "
                 "with no censored outcomes.")
     st.markdown("- No leakage. Features use only pre-cutoff orders and the churn window is "
-                "sensitivity-tested (AUC 0.87-0.90).")
+                "sensitivity-tested (AUC 0.87-0.89).")
     st.markdown("- Multicollinearity is checked with VIF; drivers are confirmed by MDI, "
                 "permutation, SHAP and logistic odds.")
     st.markdown("- Survival analysis handles censoring and adds time-to-return urgency (the "
@@ -1090,11 +1085,11 @@ with T[IDX["9 · Recommendations"]]:
     tag("GLOSSARY")
     for term, defn in [("Churn", "no purchase within 90 days."),
                        ("ROC-AUC", "how well churners are separated from stayers. 0.9 is excellent."),
-                       ("Precision at top 10%", "share of contacted top-decile customers who actually churn. About 47%, or 4.9-5x the base rate."),
+                       ("Precision at top 10%", "share of contacted top-decile customers who actually churn. About 49%, or 5x the base rate."),
                        ("CLV (3-yr)", "annualized spend x 3. The dollars at stake."),
-                       ("ROAS", "retained value per 1 dollar of offer spend. About 15.9x in the "
+                       ("ROAS", "retained value per 1 dollar of offer spend. About 20.2x in the "
                                  "executed-notebook run - a projection of the assumed response "
-                                 "curve, not a measured return."),
+                                 "curve, not a measured return (live re-solves can differ)."),
                        ("MILP", "Mixed-Integer Linear Program. Exact optimization via HiGHS."),
                        ("Survival S(t)", "probability a customer has NOT returned by day t "
                         "(no-return probability). S(90) is the 90-day no-return probability."),
