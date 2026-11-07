@@ -219,7 +219,8 @@ rebuilt on the published generation instead.
 One real defect surfaced while rebuilding: `train_models.py` scored the test period with
 **GradientBoosting only**, while the notebook MILP used the **Voting** ensemble. That is why a
 faithful rebuild produced $220,409 / 22.04x instead of the published $202,403 / 20.24x. Pointing
-the artifact at Voting reproduces the notebook exactly.
+the artifact at Voting reproduces the notebook exactly; `train_models.py` on `main` now carries
+that scoring, so re-running it regenerates the shipped figures.
 
 Kernel `vivekkopthsd/churn-predict-retrain-generation-b` (version 3) rebuilds everything on
 Kaggle from the `ff884b3` tarball and asserts the published figures:
