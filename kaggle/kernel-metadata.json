@@ -1,0 +1,18 @@
+{
+  "id": "vivekkopthsd/churn-predict-slim-artifacts",
+  "title": "churn-predict slim artifacts",
+  "code_file": "slim_artifacts.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [],
+  "dataset_sources": [
+    "vivekkopthsd/churn-predict-full-artifact"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

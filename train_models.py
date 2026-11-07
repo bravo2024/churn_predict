@@ -3,8 +3,8 @@ Train churn models (temporal validation), segment customers, and optimize the
 retention offer budget — Customer Churn Prediction & Retention Offer Optimization.
 
 DATA (built by build_dataset.py):
-  data/snapshot_train.csv - features measured up to 2022-03-19; label = no purchase in next 90 days
-  data/snapshot_test.csv  - features measured up to 2022-09-19; same 90-day label
+  data/snapshot_train.csv - features measured up to 2021-03-19; label = no purchase in next 90 days
+  data/snapshot_test.csv  - features measured up to 2021-09-19; same 90-day label
   data/customers.csv      - full-history customer table (CLV at risk, category mix)
 
 METHOD:
@@ -48,8 +48,8 @@ OUT = os.path.join(BASE, "models")
 FEATURES = ["orders_12m", "spend_12m", "aov_12m", "aov_recent", "aov_prior", "aov_trend",
             "recency_days", "active_months_12m", "category_count_12m", "avg_price_12m",
             "entertainment_share", "gaming_share", "media_share", "gift_card_share", "ott_flag",
-            "Age", "Annual_Income_USD", "Household_Size", "Hispanic", "Reported_Usage_Freq",
-            "Gender", "Education_Level", "Race_Group", "Region"]
+            "Age", "Annual_Income_USD", "Household_Size", "Reported_Usage_Freq",
+            "Gender", "Education_Level", "Region"]  # race/ethnicity excluded: not used for customer targeting
 
 # Documented response assumption: probability a customer is retained given an offer of $d
 # (small base return + linear response, saturating) - sensitivity-tested in the notebook.
@@ -85,6 +85,14 @@ def cls_metrics(y, p, prob):
             "ROC-AUC": round(roc_auc_score(y, prob), 4)}
 
 
+def best_depth(X, y, depths=(2, 3, 4, 5, 6, 8, 10)):
+    """Decision-tree depth chosen by 5-fold CV AUC on train (same sweep as the notebook)."""
+    from sklearn.model_selection import cross_val_score
+    cv = [cross_val_score(DecisionTreeClassifier(max_depth=d, random_state=RANDOM_STATE),
+                          X, y, cv=5, scoring="roc_auc").mean() for d in depths]
+    return depths[int(np.argmax(cv))]
+
+
 def precision_at_top_decile(y, prob):
     """% of the top 10% by churn probability who actually churned (targeting quality)."""
     k = max(1, len(y) // 10)
@@ -103,7 +111,7 @@ def build_artifacts():
     # ---------------- Churn models (Ch 4 / 6 / 7) ----------------------------
     models = {
         "Logistic (Ch4)": LogisticRegression(max_iter=2000, C=1.0, random_state=RANDOM_STATE).fit(Xp_tr, y_tr),
-        "DecisionTree (Ch6)": DecisionTreeClassifier(max_depth=5, random_state=RANDOM_STATE).fit(Xp_tr, y_tr),
+        "DecisionTree (Ch6)": DecisionTreeClassifier(max_depth=best_depth(Xp_tr, y_tr), random_state=RANDOM_STATE).fit(Xp_tr, y_tr),
         "RandomForest (Ch7)": RandomForestClassifier(n_estimators=200, max_depth=8, random_state=RANDOM_STATE, n_jobs=-1).fit(Xp_tr, y_tr),
         "GradientBoosting (Ch7)": GradientBoostingClassifier(n_estimators=200, learning_rate=0.08, max_depth=4, random_state=RANDOM_STATE).fit(Xp_tr, y_tr),
         "XGBoost (Ch7)": XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.08,
@@ -221,7 +229,7 @@ def build_artifacts():
     print(f"\nSegments (silhouette {sil:.3f}):"); print(segment_profiles.to_string())
 
     # ---------------- Test-period scores + offer optimization ----------------
-    prob_te = fitted["GradientBoosting (Ch7)"].predict_proba(Xp_te)[:, 1]
+    prob_te = fitted["Voting (Ch7)"].predict_proba(Xp_te)[:, 1]  # same scores as the notebook MILP
     test_scores = te[["Customer_ID"]].copy()
     test_scores["Churn_Prob"] = np.round(prob_te, 4)
     test_scores = test_scores.merge(cust[["Customer_ID", "CLV_3Yr", "Segment"]], on="Customer_ID", how="left")
@@ -324,15 +332,35 @@ def build_artifacts():
     return artifacts
 
 
+# Objects the dashboard never reads. The fitted Random Survival Forest alone is 234 MB of
+# the 246 MB full artifact, and dashboard.py only consumes survival["probs"].
+RUNTIME_UNUSED = ("tr", "te", "pre", "pre_s", "pca6", "kmeans", "prob_te",
+                  "segment_profiles", "seg_names", "silhouette")
+SURVIVAL_UNUSED = ("rsf", "cox")
+
+
+def slim_artifacts(artifacts):
+    """Runtime-only view of the artifacts: about 246 MB -> 10 MB, same dashboard output."""
+    slim = {k: v for k, v in artifacts.items() if k not in RUNTIME_UNUSED}
+    slim["survival"] = {k: v for k, v in artifacts["survival"].items()
+                        if k not in SURVIVAL_UNUSED}
+    return slim
+
+
 def main():
     artifacts = build_artifacts()
     os.makedirs(OUT, exist_ok=True)
-    with open(os.path.join(OUT, "artifacts.pkl"), "wb") as f:
+    full_path = os.path.join(OUT, "artifacts.pkl")
+    with open(full_path, "wb") as f:
         pickle.dump(artifacts, f)
+    slim_path = os.path.join(OUT, "artifacts_slim.pkl")
+    with open(slim_path, "wb") as f:
+        pickle.dump(slim_artifacts(artifacts), f, protocol=4)
     artifacts["test_scores"].to_csv(os.path.join(OUT, "churn_scores_test.csv"), index=False)
     artifacts["offer_result"]["allocation"].to_csv(os.path.join(OUT, "offer_allocation.csv"), index=False)
-    print(f"\nSaved models/artifacts.pkl + churn_scores_test.csv + offer_allocation.csv "
-          f"({os.path.getsize(os.path.join(OUT, 'artifacts.pkl'))/1e6:.1f} MB)")
+    print(f"\nSaved models/artifacts.pkl ({os.path.getsize(full_path)/1e6:.1f} MB) + "
+          f"models/artifacts_slim.pkl ({os.path.getsize(slim_path)/1e6:.1f} MB) + "
+          f"churn_scores_test.csv + offer_allocation.csv")
 
 
 if __name__ == "__main__":

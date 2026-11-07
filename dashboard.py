@@ -34,30 +34,42 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy import stats
+from scipy.sparse import csr_matrix, eye as speye, kron
 
 import os as _os
 ON_CLOUD = (_os.environ.get("STREAMLIT_SERVER_HEADLESS") == "true"
             or "streamlit.app" in _os.environ.get("HOSTNAME", ""))
 
-import train_models as tm
-
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
 BASE = os.path.dirname(os.path.abspath(__file__))
 ARTIFACTS = os.path.join(BASE, "models", "artifacts.pkl")
+SLIM_ARTIFACTS = os.path.join(BASE, "models", "artifacts_slim.pkl")
 TRAIN_CSV = os.path.join(BASE, "data", "snapshot_train.csv")
 TEST_CSV = os.path.join(BASE, "data", "snapshot_test.csv")
-FEATURES = tm.FEATURES
+# Kept in sync with train_models.FEATURES. Duplicated here so importing xgboost and
+# scikit-survival (about 180 MB of RSS) is not on the app's cold-start path.
+FEATURES = ["orders_12m", "spend_12m", "aov_12m", "aov_recent", "aov_prior", "aov_trend",
+            "recency_days", "active_months_12m", "category_count_12m", "avg_price_12m",
+            "entertainment_share", "gaming_share", "media_share", "gift_card_share", "ott_flag",
+            "Age", "Annual_Income_USD", "Household_Size", "Reported_Usage_Freq",
+            "Gender", "Education_Level", "Region"]
 # Artifacts are too large for GitHub (197 MB) and are hosted on Hugging Face.
 HF_DATA_REPO = "vivekkopthsd/churn-predict-data"
 
 
 def hf_download(filename):
-    """Download `filename` from the companion HF dataset; returns a local path or None."""
+    """Download `filename` from the companion HF dataset; returns a local path or None.
+
+    repo_type="dataset" is required. Without it huggingface_hub looks for a *model* repo of
+    the same name, receives 401, and the caller used to fall through to a full retrain - which
+    is what pushed the Community Cloud container over its resource limits.
+    """
     try:
         from huggingface_hub import hf_hub_download
-        return hf_hub_download(repo_id=HF_DATA_REPO, filename=filename)
-    except Exception:
+        return hf_hub_download(repo_id=HF_DATA_REPO, filename=filename, repo_type="dataset")
+    except Exception as exc:  # noqa: BLE001 - surfaced, never converted into training
+        st.warning(f"Hugging Face download failed for {filename}: {type(exc).__name__}")
         return None
 
 # ---------------------------------------------------------------- design
@@ -109,14 +121,28 @@ def interp(text):
 
 
 # ---------------------------------------------------------------- core logic (preserved)
-@st.cache_resource(show_spinner="Loading pre-trained suite (artifacts.pkl)...")
+@st.cache_resource(show_spinner="Loading pre-trained suite...")
 def load_artifacts():
-    path = ARTIFACTS if os.path.exists(ARTIFACTS) else hf_download("models/artifacts.pkl")
-    if path:
-        with open(path, "rb") as f:
-            return pickle.load(f)
-    with st.spinner("Artifacts missing - training (~6 min)..."):
-        return tm.build_artifacts()
+    """Load the precomputed suite, largest-first avoidance.
+
+    Order: committed slim file, full local file, slim from HF, full from HF.
+    The app never trains inside a request - on Community Cloud that retraining is what
+    pushes the container over its resource limits. Rebuild with `python train_models.py`.
+    """
+    for path in (SLIM_ARTIFACTS, ARTIFACTS):
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    for name in ("models/artifacts_slim.pkl", "models/artifacts.pkl"):
+        path = hf_download(name)
+        if path:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    st.error("Precomputed artifacts are unavailable, so the dashboard cannot start. "
+             "Training inside a request exceeds the Community Cloud resource limits, so it "
+             "is disabled here. Rebuild with `python train_models.py` and commit "
+             "models/artifacts_slim.pkl.")
+    st.stop()
 
 
 @st.cache_data(show_spinner="Loading temporal snapshots...")
@@ -249,9 +275,8 @@ def solve_milp_live(ts, B, offers=(5, 10, 15, 20, 25), base=0.04, slope=0.018, c
     DV = np.array([[pi * Vi * U[i] * (r(d) - r0) for d in offers] for i, (pi, Vi) in enumerate(zip(p, V))])
     n = len(ts)
     A_bud = np.tile(np.array(offers, dtype=float), n)
-    A_one = np.zeros((n, n * len(offers)))
-    for i in range(n):
-        A_one[i, i * len(offers):(i + 1) * len(offers)] = 1.0
+    # Each customer is one row with five non-zeros. Stored sparse: 0.19 MB, not 922 MB.
+    A_one = kron(speye(n, format="csr"), csr_matrix(np.ones((1, len(offers)))))
     res = milp(c=-DV.ravel(), integrality=np.ones(n * len(offers)), bounds=Bounds(0, 1),
                constraints=[LinearConstraint(A_bud, ub=B), LinearConstraint(A_one, ub=1.0)],
                options={"time_limit": 15})
@@ -299,15 +324,15 @@ scope = st.sidebar.radio("Analysis scope",
                               "Optimization adds the budget layer with survival weighting.")
 st.sidebar.markdown(f'<div class="amz-card">'
                     f'<div class="amz-card-title">Key result</div>'
-                    f'<div class="amz-card-text">5x precision at top 10%. MILP returns 20.2x per '
+                    f'<div class="amz-card-text">4.95x precision at top 10%. MILP returns 15.9x per '
                     f'dollar.</div></div>', unsafe_allow_html=True)
 
 with st.sidebar.expander("Data"):
     st.markdown("- Open E-Commerce 1.0 (MIT), 1.76M purchases + 5,027 survey -> 5,013 customers")
-    st.markdown("- Train features <= 2022-03-19, test on unseen 2022-09-19")
+    st.markdown("- Train features <= 2021-03-19, test on unseen 2021-09-19")
     st.markdown("- No leakage. Pre-cutoff features. CLV winsorized at p99")
 with st.sidebar.expander("Method"):
-    st.markdown("- Churn = no purchase in N days (90 used, AUC stable 0.87-0.89)")
+    st.markdown("- Churn = no purchase in N days (90 used, AUC stable 0.87-0.90)")
     st.markdown("- Models: Logistic, Trees, RF, GB, XGBoost, Voting")
     st.markdown("- Survival: RSF and Cox model time to return")
     st.markdown("- Offers: exact 0/1-knapsack MILP (HiGHS)")
@@ -349,27 +374,32 @@ with T[IDX["1 · Problem & Data"]]:
     tag("CUSTOMER PROFILE")
     st.markdown("The panel consists of US Amazon shoppers recruited through an online survey. "
                 "They are frequent buyers, with a median of 221 orders per customer over the "
-                "observation window. The 90-day churn base rate is 9.9 percent within this "
+                "observation window. The 90-day churn base rate is 9.6 percent within this "
                 "engaged, high-activity cohort, and the results describe this panel rather than "
                 "occasional shoppers.")
 
     tag("DATA SPLIT (TEMPORAL)")
     c1, c2, c3 = st.columns(3)
-    metric_card(c1, f"{len(tr):,}", "Train customers", "features up to 2022-03-19", NAVY)
-    metric_card(c2, f"{len(te):,}", "Test customers", "unseen period from 2022-09-19", BLUE)
+    metric_card(c1, f"{len(tr):,}", "Train customers", "features up to 2021-03-19", NAVY)
+    metric_card(c2, f"{len(te):,}", "Test customers", "unseen period from 2021-09-19", BLUE)
     metric_card(c3, f"{BASE_RATE:.1%}", "Churn base rate 90d", "test period", AMBER)
     interp("Train and test customers are disjoint in time. The model is built on the train "
            "period only and measured on the test period, which it never saw.")
 
     tag("TEMPORAL VALIDATION")
     c1, c2 = st.columns(2)
-    c1.markdown("**Train period** - features up to **2022-03-19**. The label is no purchase in "
-                "the next 90 days, fully observed to 2022-06-17.")
-    c2.markdown("**Test period** - features up to **2022-09-19** with the same 90-day label. "
+    c1.markdown("**Train period** - features up to **2021-03-19**. The label is no purchase in "
+                "the next 90 days, fully observed to 2021-06-17.")
+    c2.markdown("**Test period** - features up to **2021-09-19** with the same 90-day label. "
                 "The two periods are disjoint in time. The model never sees the future and no "
                 "outcome window is censored.")
     interp("This design is why the reported metrics are trustworthy. They measure prediction "
            "of the future, not reconstruction of the past.")
+    interp("Why these cutoffs: each respondent's purchase history ends at their survey "
+           "submission, so a later cutoff (e.g. 2022-09-19) mistakes survey-submission "
+           "truncation for churn - 76.5 percent of labelled churners had no data after that "
+           "cutoff at all, versus 14.2 percent at 2021-09-19, which is consistent with genuine "
+           "permanent lapse.")
 
 # ================================================================ 2
 with T[IDX["2 · Exploratory"]]:
@@ -382,14 +412,14 @@ with T[IDX["2 · Exploratory"]]:
                       y=[tr[f"label_churn_{w}"].mean() for w in (30, 60, 90, 120, 180)],
                       markers=True, template="plotly_white", labels={"x": "Window", "y": "Churn rate"})
         fig.update_traces(line_color=BLUE, marker_color=BLUE)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("90 days balances catching real churn against ignoring normal gaps.")
     with c2:
         tag("VALUE AT STAKE (CLV)")
         fig = px.histogram(cust, x="CLV_3Yr", nbins=40, template="plotly_white",
                            labels={"CLV_3Yr": "3-year CLV ($)"}, color_discrete_sequence=[BLUE])
         fig.update_layout(showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp(f"The pool is ${cust['CLV_3Yr'].sum():,.0f} and the top 10% of customers hold 34% "
                f"of it. Value is concentrated, so retention spend should be too.")
 
@@ -404,7 +434,7 @@ with T[IDX["2 · Exploratory"]]:
         fig = px.bar(bal, x="Period", y="Customers", color="Class", barmode="group",
                      template="plotly_white",
                      color_discrete_map={"Returned": BLUE, "Churned": RED}, text_auto=".2s")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp(f"Churn is rare - {tr.label_churn.mean():.1%} in train and "
                f"{te.label_churn.mean():.1%} in test. This is why Precision at top-10% is the "
                f"business metric rather than accuracy.")
@@ -415,7 +445,7 @@ with T[IDX["2 · Exploratory"]]:
         fig = px.bar(ott_df, x="group", y="label_churn", template="plotly_white",
                      labels={"group": "", "label_churn": "90d churn rate"}, text_auto=".1%",
                      color_discrete_sequence=[BLUE])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("Subscription-style buyers churn about 3x less. They are a cross-sell audience.")
 
     c1, c2 = st.columns(2)
@@ -424,7 +454,7 @@ with T[IDX["2 · Exploratory"]]:
         fig = px.box(te, x="label_churn", y="aov_trend", template="plotly_white",
                      labels={"label_churn": "90-day outcome", "aov_trend": "AOV trend ($)"},
                      color="label_churn", color_discrete_map={0: BLUE, 1: RED})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("A falling basket size precedes churn. It is a CRM early-warning signal.")
     with c2:
         tag("CORRELATES OF CHURN")
@@ -434,7 +464,7 @@ with T[IDX["2 · Exploratory"]]:
                      labels={"x": "Correlation with 90d churn", "y": ""},
                      color=np.sign(cc.values),
                      color_discrete_map={-1.0: GREEN, 1.0: RED}).update_layout(showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("Rising recency raises churn risk. Activity, spend and category breadth protect against it.")
 
     tag("CORRELATES OF CLV")
@@ -444,7 +474,7 @@ with T[IDX["2 · Exploratory"]]:
                  labels={"x": "Correlation with CLV", "y": ""},
                  color=np.sign(cc2.values),
                  color_discrete_map={-1.0: GREEN, 1.0: RED}).update_layout(showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     interp("Value follows spend, order count and category breadth, not demographics.")
 
     tag("RFM SCORE AND QUADRANT")
@@ -458,7 +488,7 @@ with T[IDX["2 · Exploratory"]]:
     with c1:
         fig = px.histogram(rfm, x="RFM_Score", nbins=40, template="plotly_white",
                            color_discrete_sequence=[BLUE]).update_layout(showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("The composite combines recency, frequency and monetary value. Higher score "
                "means a more engaged customer.")
     with c2:
@@ -466,7 +496,7 @@ with T[IDX["2 · Exploratory"]]:
                          log_y=True, template="plotly_white",
                          labels={"Recency_Days": "Recency (days)", "Order_Count": "Orders",
                                  "Total_Spend_USD": "Total spend"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("The quadrant shows value concentration. Recency, frequency and monetary are "
                "the churn-model predictors. The composite score is used for analysis and "
                "segmentation only, not added to the model, because it is perfectly collinear "
@@ -511,13 +541,13 @@ with T[IDX["3 · Churn Model"]]:
         c1.markdown("**Confusion matrix (test period)**")
         c1.plotly_chart(px.imshow(lab["conf"], text_auto=True, color_continuous_scale="Blues",
                                   template="plotly_white", labels=dict(x="Predicted", y="Actual"),
-                                  x=["Returned", "Churned"], y=["Returned", "Churned"]), use_container_width=True)
+                                  x=["Returned", "Churned"], y=["Returned", "Churned"]), width='stretch')
         if lab["imp"] is not None:
             c2.markdown("**Feature importance (this model)**")
             fig = px.bar(lab["imp"].head(10).reset_index().rename(columns={"index": "Feature", 0: "Importance"}),
                          x="Importance", y="Feature", orientation="h", template="plotly_white",
                          color="Importance", color_continuous_scale="Blues").update_layout(yaxis={"autorange": "reversed"})
-            c2.plotly_chart(fig, use_container_width=True)
+            c2.plotly_chart(fig, width='stretch')
         interp(f"ROC-AUC {m['ROC-AUC']:.3f} with Precision at top-10% of {m['Prec@10%']:.0%} means "
                f"the riskiest decile is contacted first. That is the efficient way to spend a budget.")
         if cfg["algo"] == "Decision Tree" and lab.get("model") is not None:
@@ -533,7 +563,7 @@ with T[IDX["3 · Churn Model"]]:
                 "or set the controls and click Train and Evaluate.")
         cs = A["churn_summary"]
         c1, c2, c3, c4 = st.columns(4)
-        metric_card(c1, f"{cs['test_customers']:,}", "Customers in test period", "unseen 2022-09-19 window", NAVY)
+        metric_card(c1, f"{cs['test_customers']:,}", "Customers in test period", "unseen 2021-09-19 window", NAVY)
         metric_card(c2, f"{cs['actual_churned']:,}", "Actually churned", f"base rate {cs['base_rate']:.1%}", RED)
         metric_card(c3, f"{cs['predicted_churned_05']:,}", "Predicted churned (0.5 cutoff)", "XGBoost on test", AMBER)
         metric_card(c4, f"{cs['top10_list_size']:,}", "Win-back target list", f"{cs['top10_precision']:.0%} actually churn", GREEN)
@@ -547,28 +577,28 @@ with T[IDX["3 · Churn Model"]]:
                                             "Recall": 0.0, "F1-Score": 0.0, "ROC-AUC": 0.5,
                                             "Prec@10%": round(BASE_RATE, 3), "Lift@10%": 1.0}
         tag("FULL ML METRICS (TEMPORAL TEST PERIOD)")
-        st.dataframe(bench.style.highlight_max(axis=0), use_container_width=True)
+        st.dataframe(bench.style.highlight_max(axis=0), width='stretch')
         interp("All metrics are measured on the unseen test period. The baseline always predicts "
                "return, so it catches no churners. Lift at 10% compares the top decile with the "
-               "base rate. The Voting ensemble reaches 5x.")
+               "base rate. The Voting ensemble reaches about 4.95x.")
         cm = voting_test_confusion()
         tn, fp, fn, tp = cm.ravel()
         c1, c2 = st.columns(2)
         c1.markdown("**Confusion matrix (Voting, temporal test)**")
         c1.plotly_chart(px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
                                   template="plotly_white", labels=dict(x="Predicted", y="Actual"),
-                                  x=["Returned", "Churned"], y=["Returned", "Churned"]), use_container_width=True)
+                                  x=["Returned", "Churned"], y=["Returned", "Churned"]), width='stretch')
         c2.markdown("**How to read it**")
         c2.markdown(f"- True negatives {tn:,} - returned and predicted returned")
         c2.markdown(f"- False positives {fp:,} - returned but flagged churned")
         c2.markdown(f"- False negatives {fn:,} - churned but predicted returned (the miss)")
         c2.markdown(f"- True positives {tp:,} - churned and predicted churned")
         interp(f"At the 0.5 threshold the model catches {tp:,} of {tp + fn:,} churners. Recall is "
-               f"modest because churn is rare (9.9 percent). Production uses the top-decile "
-               f"ranking instead, where about 49 percent of the targeted customers actually churn.")
+               f"modest because churn is rare (9.6 percent). Production uses the top-decile "
+               f"ranking instead, where about {cs['top10_precision']:.0%} of the targeted customers actually churn.")
         bv = train_test_auc()
         st.markdown("**Bias-variance view (train vs test AUC)**")
-        st.dataframe(bv, use_container_width=True)
+        st.dataframe(bv, width='stretch')
         interp("The gap between train and test AUC is the overfit signal. Logistic has almost "
                "no gap with near-equal test AUC, and the Voting ensemble keeps the best test AUC "
                "with a moderate gap. Together they cover the bias-variance trade-off.")
@@ -579,7 +609,7 @@ with T[IDX["3 · Churn Model"]]:
         lr = A["fitted_models"]["Logistic (Ch4)"]
         coef = pd.Series(lr.coef_[0], index=A["feature_names"]).sort_values(ascending=False)
         topc = pd.concat([coef.head(5), coef.tail(3)]).rename("beta")
-        st.dataframe(topc.round(3).to_frame(), use_container_width=True)
+        st.dataframe(topc.round(3).to_frame(), width='stretch')
         st.caption(f"Intercept beta0 = {lr.intercept_[0]:.3f} on standardized features. Positive "
                    f"beta raises churn odds, negative beta protects.")
         st.markdown("**Feature thresholds from a shallow decision tree (raw units, "
@@ -611,13 +641,13 @@ with T[IDX["3 · Churn Model"]]:
         tag("FEATURES USED AND IMPORTANCE BY MODEL")
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**All 24 features** (behaviour, category, demographics)")
+            st.markdown(f"**All {len(FEATURES)} features** (behaviour, category, demographics; race/ethnicity excluded)")
             groups = {
                 "Behavioural": ["orders_12m", "spend_12m", "aov_12m", "aov_recent", "aov_prior", "aov_trend",
                                 "recency_days", "active_months_12m", "category_count_12m", "avg_price_12m", "gift_card_share"],
                 "Category": ["entertainment_share", "gaming_share", "media_share", "ott_flag"],
-                "Demographics": ["Age", "Annual_Income_USD", "Household_Size", "Hispanic", "Reported_Usage_Freq",
-                                 "Gender", "Education_Level", "Race_Group", "Region"]}
+                "Demographics": ["Age", "Annual_Income_USD", "Household_Size", "Reported_Usage_Freq",
+                                 "Gender", "Education_Level", "Region"]}
             for g, fs in groups.items():
                 st.markdown(f"**{g}** - " + ", ".join(fs))
             st.caption("The same feature set feeds every model. Features are standardized and "
@@ -631,7 +661,7 @@ with T[IDX["3 · Churn Model"]]:
                 fig = px.bar(x=imp_s.values, y=imp_s.index, orientation="h", template="plotly_white",
                              labels={"x": "Importance", "y": ""}, color=imp_s.values,
                              color_continuous_scale="Blues").update_layout(yaxis={"autorange": "reversed"})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
             else:
                 st.markdown("Voting averages the probabilities of Logistic, Random Forest and "
                             "Gradient Boosting, so its importance is the union of its members. "
@@ -651,14 +681,14 @@ with T[IDX["4 · Importance"]]:
         fig = px.bar(A["rf_imp"].head(10), x="MDI_Importance", y="Feature", orientation="h",
                      template="plotly_white", color="MDI_Importance", color_continuous_scale="Blues",
                      labels={"MDI_Importance": "Importance"}).update_layout(yaxis={"autorange": "reversed"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("How strongly each feature splits churners from stayers.")
     with c2:
         tag("PERMUTATION IMPORTANCE")
         fig = px.bar(A["perm_imp"].head(10), x="Perm_Importance", y="Feature", orientation="h",
                      template="plotly_white", color="Perm_Importance", color_continuous_scale="Viridis",
                      labels={"Perm_Importance": "Importance"}).update_layout(yaxis={"autorange": "reversed"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         interp("How much accuracy drops when a feature is shuffled. This shows what the model "
                "truly needs.")
 
@@ -667,7 +697,7 @@ with T[IDX["4 · Importance"]]:
     fig = px.bar(sh, x="Mean_Abs_SHAP", y="Feature", orientation="h", template="plotly_white",
                  color="Mean_Abs_SHAP", color_continuous_scale="Viridis",
                  labels={"Mean_Abs_SHAP": "Mean |SHAP|"}).update_layout(yaxis={"autorange": "reversed"})
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     interp("SHAP gives every feature a per-customer contribution to the churn score. It agrees "
            "with MDI and permutation importance, confirming the drivers are stable.")
 
@@ -680,7 +710,7 @@ with T[IDX["4 · Importance"]]:
                  labels={"coef": "Log-odds change per 1 std unit", "y": ""},
                  color="dir", color_discrete_map={"Increases churn risk": RED, "Protects against churn": GREEN}
                  ).update_layout(yaxis={"autorange": "reversed"}, showlegend=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     interp("Recency and a falling order count raise churn odds. Order velocity, active months "
            "and category breadth lower them. Demographics have small effects. Correlated "
            "features are checked with VIF in the notebook.")
@@ -688,8 +718,8 @@ with T[IDX["4 · Importance"]]:
     tag("DEFINITION ROBUSTNESS (ML METRICS)")
     sdf = A["sensitivity_df"].copy()
     sdf.columns = ["Churn window (days)", "Base rate (train)", "Base rate (test)", "AUC (temporal test)"]
-    st.dataframe(sdf, use_container_width=True)
-    interp("AUC stays within 0.87-0.89 across 30-180 day definitions. The model is robust to "
+    st.dataframe(sdf, width='stretch')
+    interp("AUC stays within 0.87-0.90 across 30-180 day definitions. The model is robust to "
            "the churn cutoff, so 90 days is a defensible choice.")
 
 # ================================================================ 5 (survival, optional)
@@ -717,20 +747,20 @@ if "Survival" in scope:
             fig = px.line(x=[f"{h}d" for h in sv["horizons"]], y=means.values, markers=True,
                           template="plotly_white", labels={"x": "Horizon", "y": "Mean S(t)"})
             fig.update_traces(line_color=BLUE, marker_color=BLUE)
-            st.plotly_chart(fig, use_container_width=True)
-            interp("S(90) is 0.11, matching the binary 90-day churn rate of 9.9 percent. The "
+            st.plotly_chart(fig, width='stretch')
+            interp("S(90) is about 0.099, matching the binary 90-day churn rate of 9.6 percent. The "
                    "two views agree, and the survival curve adds the time dimension (its "
                    "c-index is in-sample only, see the caveat above).")
         with c2:
             tag("EXPECTED DAYS TO RETURN (URGENCY)")
             fig = px.histogram(sp, x="Expected_Days_To_Return", nbins=30, template="plotly_white",
                                color_discrete_sequence=[BLUE])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             interp("A short expected return time means the customer is urgent but less likely "
                    "lost. The optimizer weights offers by S(30) to prioritise those closest to "
                    "no-return (never returning).")
         tag("SURVIVAL SCORES (SAMPLE)")
-        st.dataframe(sp.head(8).round(3), use_container_width=True)
+        st.dataframe(sp.head(8).round(3), width='stretch')
         interp(f"Correlation between survival S(90) and the binary churn probability is "
                f"{sv['corr_s90_binary']:.2f}. Survival adds urgency, which the binary model "
                f"cannot express, and the same MILP optimizer accepts both probability sources.")
@@ -759,7 +789,7 @@ with T[IDX["6 · Segments"]]:
         fig = px.line(x=range(1, len(cum) + 1), y=cum, markers=True, template="plotly_white",
                       labels={"x": "Component", "y": "Cumulative variance"})
         fig.add_hline(y=0.95, line_dash="dash", line_color=RED)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         load = pd.DataFrame(pca_all.components_[:2], columns=seg_feats, index=["PC1", "PC2"])
         for pc in ["PC1", "PC2"]:
             top = load.loc[pc].abs().sort_values(ascending=False).head(4)
@@ -768,7 +798,7 @@ with T[IDX["6 · Segments"]]:
         sils = silhouette_by_k(pca6)
         fig = px.line(x=list(sils.keys()), y=list(sils.values()), markers=True, template="plotly_white",
                       labels={"x": "Segments (k)", "y": "Silhouette"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     interp(f"Six components retain {pca6_model.explained_variance_ratio_.sum():.0%} of variance "
            f"and silhouettes are comparable across k=3-7, so k=4 is chosen for business "
            f"interpretability. PC1 separates value and activity, PC2 separates engagement breadth.")
@@ -788,7 +818,7 @@ with T[IDX["6 · Segments"]]:
     c1.metric("Segments", f"k = {k_choice}",
               f"silhouette {__import__('sklearn.metrics', fromlist=['silhouette_score']).silhouette_score(pca6, km.labels_):.3f}")
     c2.metric("Total 3-yr value pool", f"${cust['CLV_3Yr'].sum():,.0f}")
-    st.dataframe(prof, use_container_width=True)
+    st.dataframe(prof, width='stretch')
     interp("High-Value Loyalists are few and worth the most. Light / Disengaged is the largest "
            "risk pool. Occasional shoppers are the cross-sell opportunity.")
 
@@ -800,7 +830,7 @@ with T[IDX["6 · Segments"]]:
     sc["Value at risk (3yr $)"] = overlay.groupby("Segment")["Churn_Prob"].apply(
         lambda s: (s * overlay.loc[s.index, "CLV_3Yr"].fillna(0)).sum()).round(0)
     st.markdown("**Churn risk and value at risk by segment**")
-    st.dataframe(sc, use_container_width=True)
+    st.dataframe(sc, width='stretch')
     interp("Value at risk is churn probability times CLV, summed per segment. It is the dollar "
            "exposure each segment represents.")
 
@@ -809,7 +839,7 @@ with T[IDX["6 · Segments"]]:
                         "Segment": cust.assign(Cluster=km.labels_)["Cluster"].map(seg_map),
                         "CLV": cust["CLV_3Yr"]})
     st.plotly_chart(px.scatter(viz, x="PC1", y="PC2", color="Segment", size="CLV", opacity=0.6,
-                               template="plotly_white", size_max=26), use_container_width=True)
+                               template="plotly_white", size_max=26), width='stretch')
 
 # ================================================================ 7 (optimizer)
 with T[IDX["7 · Optimizer (MILP)"]]:
@@ -818,10 +848,11 @@ with T[IDX["7 · Optimizer (MILP)"]]:
           "is maximized under the budget.")
     if "Survival" in scope:
         use_surv = st.checkbox("Weight offers by time-to-return (survival)",
-                               value=(scope == "Churn + Optimization + Survival"),
+                               value=False,
                                help="Uses the survival-based 90-day no-return probability S(90) and an "
                                      "urgency weight S(30) inside the objective. Off uses the binary "
-                                     "model probability.")
+                                     "model probability. Survival weighting is solved only when you "
+                                     "ask for it, so the first page load stays cheap.")
     else:
         use_surv = False
     B = st.slider("Retention budget ($)", 1000, 20000, 10000, 1000, key="milp_budget",
@@ -839,11 +870,21 @@ with T[IDX["7 · Optimizer (MILP)"]]:
     def response(d, base=0.04, slope=0.018, cap=0.60):
         return float(np.clip(base + slope * d, 0.0, cap))
 
+    precomputed = OFFER["milp_by_budget"][int(B)]
     if use_surv:
-        with st.spinner("Solving the exact MILP with survival weights..."):
-            m = solve_milp_live(ts_off, B)
+        solved = st.session_state.setdefault("milp_surv", {})
+        if st.button("Solve survival-weighted allocation", type="primary",
+                     help="Runs the exact MILP once at the selected budget and keeps the result."):
+            with st.spinner("Solving the exact MILP with survival weights..."):
+                solved[int(B)] = solve_milp_live(ts_off, B)
+        m = solved.get(int(B))
+        if m is None:
+            st.info("Click the button above to solve the survival-weighted allocation at this "
+                    "budget. Until then the cards show the precomputed binary-probability "
+                    "optimum for the same budget.")
+            m = precomputed
     else:
-        m = OFFER["milp_by_budget"][int(B)]
+        m = precomputed
 
     # greedy + naive for the selected mode (fast, live)
     _p = ts_off["Churn_Prob"].to_numpy()
@@ -879,11 +920,11 @@ with T[IDX["7 · Optimizer (MILP)"]]:
            f"${greedy_rev:,.0f} for the greedy and ${naive_rev:,.0f} for naive spend. "
            + ("Survival weighting is active, so high-value customers with the highest "
                "no-return probability are prioritised." if use_surv else "The binary-model probability is used."))
-    st.caption("These figures are solved live in this dashboard from the local artifact "
-               "pipeline, so they can differ from the executed notebook (which reported "
-               "$202,403 retained, ROAS 20.2x, greedy $80,539, naive $67,516 at a $10,000 "
-               "budget with voting-model probabilities). ROAS is a projection of the assumed "
-               "response curve, not a measured return; solver runs vary run to run.")
+    st.caption("These figures are read from the precomputed artifact (train_models.py), using "
+               "voting-ensemble probabilities - the same scoring as the executed notebook, so at "
+               "a $10,000 budget both report the identical figure (about $159,027 retained, ROAS "
+               "15.9x, greedy $66,664, naive $57,768). Survival weighting is solved on request. "
+               "ROAS is a projection of the assumed response curve, not a measured return.")
 
     cv = OFFER["curve"]
     fig = px.line(cv, x="Budget_USD", y="Retained_Rev_MILP", markers=True, template="plotly_white",
@@ -895,7 +936,7 @@ with T[IDX["7 · Optimizer (MILP)"]]:
     fig.add_scatter(x=cv["Budget_USD"], y=cv["Retained_Rev_CheapestFirst"], mode="lines+markers",
                     name="Naive (cheapest first)", line_color=RED, marker_color=RED)
     fig.add_vline(x=B, line_dash="dash", line_color=NAVY)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     interp("The gap between the curves is the dollar value of exact optimization. The curve "
            "uses the binary probability; the cards and list use the selected scoring mode.")
 
@@ -917,7 +958,7 @@ with T[IDX["7 · Optimizer (MILP)"]]:
     shown = m["allocation"].head(m["customers"])
     st.dataframe(shown[["Customer_ID", "Churn_Prob", "CLV_3Yr", "Offer_USD", "Incr_Retained_Rev"]]
                  .rename(columns={"Incr_Retained_Rev": "Expected retained $"}).reset_index(drop=True),
-                 use_container_width=True, height=320)
+                 width='stretch', height=320)
     interp("These customers are contacted first. The table shows risk, value at stake, and the "
            "optimal offer size. Larger offers are concentrated on high-value high-risk "
            "customers" + (", prioritised by no-return urgency (survival mode)." if use_surv else "."))
@@ -929,14 +970,14 @@ with T[IDX["8 · A/B Test"]]:
     doing("The win-back experiment is designed with a two-proportion z-test. Sample size and "
           "power are computed from the hypotheses, and the mathematics is shown below.")
     c1, c2, c3 = st.columns(3)
-    p0 = c1.slider("Baseline 90-day repurchase rate", 0.30, 0.95, 0.52, 0.01,
-                   help="0.52 is the top-decile high-risk cohort. 0.90 is all customers.")
+    p0 = c1.slider("Baseline 90-day repurchase rate", 0.30, 0.95, 0.552, 0.01,
+                   help="0.552 is the top-decile high-risk cohort. 0.90 is all customers.")
     mde = c2.slider("Minimum detectable effect (pp)", 2, 20, 10, 1)
     alpha = c3.slider("Significance level alpha", 0.01, 0.10, 0.05, 0.01)
     c4, c5 = st.columns(2)
     pwr_target = c4.slider("Power target", 0.50, 0.95, 0.80, 0.05)
-    n_avail = c5.slider("Customers per group available", 50, 800, 242, 10,
-                        help="242 is half of the 485-customer top-decile list.")
+    n_avail = c5.slider("Customers per group available", 50, 800, 240, 10,
+                        help="240 is half of the 480-customer top-decile list.")
 
     za = stats.norm.ppf(1 - alpha / 2)
     zb = stats.norm.ppf(pwr_target)
@@ -950,9 +991,9 @@ with T[IDX["8 · A/B Test"]]:
     metric_card(c3, f"+{mde}pp", "Minimum detectable effect", f"from {p0:.0%} baseline", BLUE)
     metric_card(c4, f"{p1 - p0:+.0%}", "Effect under H1", f"p1 = {p1:.1%}", GRAY)
     interp(f"At {n_avail:,} customers per group the design detects a +{mde}pp lift with "
-           f"{pow_avail:.0%} power. The current top-decile list, 242 per group, reaches the "
+           f"{pow_avail:.0%} power. The current top-decile list, 240 per group, reaches the "
            f"power target only for lifts around +12pp, so the rollout may need the top three "
-           f"deciles, about 1,455 customers, or a directional read.")
+           f"deciles, about 1,440 customers, or a directional read.")
 
     mdes = np.arange(0.02, 0.20, 0.005)
     pow_curve = [stats.norm.cdf(np.sqrt(n_avail * d ** 2 / (p0 * (1 - p0) + (p0 + d) * (1 - p0 - d))) - za) for d in mdes]
@@ -960,7 +1001,7 @@ with T[IDX["8 · A/B Test"]]:
                   labels={"x": "Minimum detectable effect (pp)", "y": "Power"})
     fig.update_traces(line_color=BLUE, marker_color=BLUE, name="Power at available sample")
     fig.add_hline(y=pwr_target, line_dash="dash", line_color=RED)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     interp("The curve shows the detectable effect at the available sample size. The red line "
            "is the power target.")
 
@@ -970,7 +1011,7 @@ with T[IDX["8 · A/B Test"]]:
                    template="plotly_white", labels={"x": "Minimum detectable effect (pp)", "y": "Customers per group"})
     fig2.update_traces(line_color=GREEN, marker_color=GREEN)
     fig2.add_hline(y=n_avail, line_dash="dash", line_color=NAVY)
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
     interp("The required sample falls steeply as the detectable effect grows. The navy line is "
            "the available sample.")
 
@@ -1029,7 +1070,7 @@ with T[IDX["9 · Recommendations"]]:
     st.markdown("- Temporal validation. The model is evaluated on a future period it never saw, "
                 "with no censored outcomes.")
     st.markdown("- No leakage. Features use only pre-cutoff orders and the churn window is "
-                "sensitivity-tested (AUC 0.87-0.89).")
+                "sensitivity-tested (AUC 0.87-0.90).")
     st.markdown("- Multicollinearity is checked with VIF; drivers are confirmed by MDI, "
                 "permutation, SHAP and logistic odds.")
     st.markdown("- Survival analysis handles censoring and adds time-to-return urgency (the "
@@ -1049,11 +1090,11 @@ with T[IDX["9 · Recommendations"]]:
     tag("GLOSSARY")
     for term, defn in [("Churn", "no purchase within 90 days."),
                        ("ROC-AUC", "how well churners are separated from stayers. 0.9 is excellent."),
-                       ("Precision at top 10%", "share of contacted top-decile customers who actually churn. About 49%, or 5x the base rate."),
+                       ("Precision at top 10%", "share of contacted top-decile customers who actually churn. About 47%, or 4.9-5x the base rate."),
                        ("CLV (3-yr)", "annualized spend x 3. The dollars at stake."),
-                       ("ROAS", "retained value per 1 dollar of offer spend. About 20.2x in the "
+                       ("ROAS", "retained value per 1 dollar of offer spend. About 15.9x in the "
                                  "executed-notebook run - a projection of the assumed response "
-                                 "curve, not a measured return (live re-solves can differ)."),
+                                 "curve, not a measured return."),
                        ("MILP", "Mixed-Integer Linear Program. Exact optimization via HiGHS."),
                        ("Survival S(t)", "probability a customer has NOT returned by day t "
                         "(no-return probability). S(90) is the 90-day no-return probability."),
