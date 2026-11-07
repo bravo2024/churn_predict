@@ -240,19 +240,25 @@ def voting_test_eval():
 
     Returned together so the count on the card and the confusion matrix beneath it are the
     same model at the same 0.5 cutoff. The artifact's churn_summary reports the XGBoost
-    count, which is a different number (367 against 323) and used to sit next to a Voting
-    matrix with no label saying so.
+    count and the XGBoost top-decile list (367 flagged, 0.4804 precision), which are
+    different numbers from the Voting ensemble (323 flagged, 0.4866) that the CV quotes.
+    Deriving both here keeps one model on the screen.
     """
     tr, te = load_snapshots()
     Xp_tr, pre = make_pre(tr)
     Xp_te = pre.transform(te[FEATURES])
     y = te["label_churn"].values
-    pred = A["fitted_models"]["Voting (Ch7)"].predict(Xp_te)
+    prob = A["fitted_models"]["Voting (Ch7)"].predict_proba(Xp_te)[:, 1]
+    pred = (prob >= 0.5).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred).ravel()
+    order = np.argsort(-prob)[:LIST_N]
+    caught = int(y[order].sum())
     return {"conf": confusion_matrix(y, pred), "predicted_churned": int(pred.sum()),
             "customers": int(len(y)), "churners": int(y.sum()),
             "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
-            "recall": float(tp / (tp + fn)) if tp + fn else 0.0}
+            "recall": float(tp / (tp + fn)) if tp + fn else 0.0,
+            "list_n": int(len(order)), "list_caught": caught,
+            "list_precision": caught / len(order) if len(order) else 0.0}
 
 
 @st.cache_data(show_spinner=False)
@@ -373,7 +379,7 @@ scope = st.sidebar.radio("Analysis scope",
                          help="Churn shows the binary model. Survival adds time-to-return. "
                               "Optimization adds the budget layer with survival weighting.")
 panel("Key result",
-      f"{TOP10_PREC:.0%} of the highest-risk decile churns, {TOP10_LIFT:.1f}x the base rate. "
+      f"{TOP10_PREC:.1%} of the highest-risk decile churns, {TOP10_LIFT:.1f}x the base rate. "
       f"The exact allocation returns {OFFER['roas']:.1f}x per dollar.",
       where=st.sidebar)
 
@@ -614,10 +620,11 @@ with T[IDX["3 · Churn Model"]]:
         metric_card(c1, f"{cs['test_customers']:,}", "Customers in test period", "unseen 2022-09-19 window", NAVY)
         metric_card(c2, f"{cs['actual_churned']:,}", "Actually churned", f"base rate {cs['base_rate']:.1%}", RED)
         metric_card(c3, f"{ve['predicted_churned']:,}", "Flagged churn (0.5 cutoff)", "Voting, temporal test", AMBER)
-        metric_card(c4, f"{cs['top10_list_size']:,}", "Win-back target list", f"{cs['top10_precision']:.0%} actually churn", GREEN)
+        metric_card(c4, f"{ve['list_n']:,}", "Win-back target list",
+                    f"{ve['list_precision']:.1%} actually churn", GREEN)
         interp(f"Production uses the top-10% list, not the 0.5 cutoff. The list of "
-               f"{cs['top10_list_size']:,} highest-risk customers contains "
-               f"{cs['top10_churners_caught']:,} real churners, so contacting it is far more "
+               f"{ve['list_n']:,} highest-risk customers contains "
+               f"{ve['list_caught']:,} real churners, so contacting it is far more "
                f"efficient than blanket outreach.")
         bench = A["churn_metrics_df"].copy()
         bench["Lift@10%"] = (bench["Prec@10%"] / BASE_RATE).round(1)
@@ -643,7 +650,7 @@ with T[IDX["3 · Churn Model"]]:
         c2.markdown(f"- True positives {tp:,} - churned and predicted churned")
         interp(f"At the 0.5 threshold the model catches {tp:,} of {tp + fn:,} churners, a recall of "
                f"{ve['recall']:.0%}. Churn is rare ({BASE_RATE:.1%}), so production uses the "
-               f"top-decile ranking instead, where {TOP10_PREC:.0%} of the targeted customers "
+               f"top-decile ranking instead, where {TOP10_PREC:.1%} of the targeted customers "
                f"actually churn.")
         bv = train_test_auc()
         st.markdown("**Bias-variance view (train vs test AUC)**")
@@ -1099,7 +1106,7 @@ with T[IDX["9 · Recommendations"]]:
     recs = [
         ("P1", "Deploy the weekly churn score in the CRM",
          f"the top decile of scored customers ({N_AT_RISK:,} customers, ${REV_AT_RISK:,.0f} at "
-         f"risk) is routed to the win-back workflow. {TOP10_PREC:.0%} of that list churns "
+         f"risk) is routed to the win-back workflow. {TOP10_PREC:.1%} of that list churns "
          f"without intervention, {TOP10_LIFT:.1f}x the base rate."),
         ("P1", "Replace blanket discounts with the MILP allocation",
          f"at a ${OFFER['budget']:,.0f} budget the exact allocation retains "
@@ -1151,7 +1158,7 @@ with T[IDX["9 · Recommendations"]]:
                        ("ROC-AUC", "how well churners are separated from stayers. 0.9 is excellent."),
                        ("Precision at top 10%",
                         f"share of contacted top-decile customers who actually churn. "
-                        f"{TOP10_PREC:.0%}, or {TOP10_LIFT:.1f}x the base rate."),
+                        f"{TOP10_PREC:.1%}, or {TOP10_LIFT:.1f}x the base rate."),
                        ("CLV (3-yr)", "annualized spend x 3. The dollars at stake."),
                        ("ROAS", f"retained value per 1 dollar of offer spend. {OFFER['roas']:.1f}x "
                                 f"in the executed-notebook run, a projection of the assumed "

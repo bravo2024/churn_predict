@@ -55,6 +55,14 @@ def main():
     auc = sens["AUC (temporal test)"]
     assert 0.86 <= float(auc.min()) <= float(auc.max()) <= 0.90, auc.tolist()
 
+    # The figures the CV quotes (cv_assurant.tex): 1.76M records, 5,013 customers,
+    # 24 features, voting ensemble, ROC-AUC 0.898, 0.487 top-decile precision, 0.87-0.89.
+    assert len(a["cust"]) == 5013, len(a["cust"])
+    assert round(float(bench.loc["Voting (Ch7)", "ROC-AUC"]), 3) == 0.898
+    assert round(float(bench.loc["Voting (Ch7)", "Prec@10%"]), 3) == 0.487
+    assert (round(float(auc.min()), 2), round(float(auc.max()), 2)) == (0.87, 0.89)
+    assert len(a["sensitivity_df"]) == 5, "CV says five churn-window definitions"
+
     # The list the dashboard calls out must be the list the artifact scored.
     assert cs["top10_list_size"] == 485 and abs(cs["top10_precision"] - 0.4804) < 0.001
 
@@ -69,7 +77,7 @@ def main():
     assert not hits, f"retired hardcoded figures in dashboard.py: {hits}"
 
     for needed in ["response(", "OFFERS", "RESPONSE", "min_detectable_effect",
-                   "voting_test_eval", "panel("]:
+                   "voting_test_eval", "list_precision", "panel("]:
         assert needed in src, f"dashboard.py lost {needed}"
 
     print("OK  artifact and dashboard contract hold")
